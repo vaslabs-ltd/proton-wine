@@ -520,6 +520,7 @@ static HRESULT WINAPI aac_decoder_ProcessOutput(IMFTransform *iface, DWORD flags
     struct wg_sample wg_sample = {0};
     IMFMediaBuffer *media_buffer;
     MFT_OUTPUT_STREAM_INFO info;
+    UINT32 buffer_size;
     HRESULT hr;
 
     TRACE("iface %p, flags %#x, count %u, samples %p, status %p.\n", iface, flags, count, samples, status);
@@ -549,6 +550,7 @@ static HRESULT WINAPI aac_decoder_ProcessOutput(IMFTransform *iface, DWORD flags
 
     if (FAILED(hr = IMFMediaBuffer_Lock(media_buffer, &wg_sample.data, &wg_sample.size, NULL)))
         goto done;
+    wg_sample.size = buffer_size;
 
     if (wg_sample.size < info.cbSize)
         hr = MF_E_BUFFERTOOSMALL;

@@ -30,6 +30,7 @@
 WINE_DEFAULT_DEBUG_CHANNEL(mfplat);
 
 DEFINE_MEDIATYPE_GUID(MFAudioFormat_XMAudio2, 0x0166);
+DEFINE_MEDIATYPE_GUID(MFAudioFormat_RAW_AAC, WAVE_FORMAT_RAW_AAC1);
 
 struct video_processor
 {
@@ -410,6 +411,7 @@ class_objects[] =
     { &CLSID_VideoProcessorMFT, &video_processor_create },
     { &CLSID_GStreamerByteStreamHandler, &winegstreamer_stream_handler_create },
     { &CLSID_WINEAudioConverter, &audio_converter_create },
+    { &CLSID_WMADecMediaObject, &wma_decoder_create },
     { &CLSID_CColorConvertDMO, &color_converter_create },
     { &CLSID_MSH264DecoderMFT, &h264_decoder_create },
     { &CLSID_MSAACDecMFT, &aac_decoder_create },
@@ -460,12 +462,6 @@ static const GUID *wma_decoder_output_types[] =
 {
     &MFAudioFormat_PCM,
     &MFAudioFormat_Float,
-};
-
-static WCHAR video_processorW[] = L"Video Processor MFT";
-static const GUID *video_processor_supported_types[] =
-{
-    &MFVideoFormat_IYUV,
 };
 
 static WCHAR color_converterW[] = L"Color Converter";
@@ -548,17 +544,6 @@ mfts[] =
         wma_decoder_input_types,
         ARRAY_SIZE(wma_decoder_output_types),
         wma_decoder_output_types,
-    },
-    {
-        &CLSID_VideoProcessorMFT,
-        &MFT_CATEGORY_VIDEO_PROCESSOR,
-        video_processorW,
-        0,
-        &MFMediaType_Video,
-        ARRAY_SIZE(video_processor_supported_types),
-        video_processor_supported_types,
-        ARRAY_SIZE(video_processor_supported_types),
-        video_processor_supported_types,
     },
     {
         &CLSID_CColorConvertDMO,
@@ -648,6 +633,7 @@ video_formats[] =
     {&MFVideoFormat_YUY2,   WG_VIDEO_FORMAT_YUY2},
     {&MFVideoFormat_YV12,   WG_VIDEO_FORMAT_YV12},
     {&MFVideoFormat_YVYU,   WG_VIDEO_FORMAT_YVYU},
+    {&MFVideoFormat_H264,   WG_VIDEO_FORMAT_H264},
 };
 
 static const struct
@@ -793,6 +779,58 @@ static void mf_media_type_to_wg_format_audio(IMFMediaType *type, struct wg_forma
     format->u.audio.channel_mask = channel_mask;
     format->u.audio.rate = rate;
 
+    if (IsEqualGUID(&subtype, &MFAudioFormat_AAC))
+    {
+        UINT32 payload_type, indication, user_data_size;
+        unsigned char *user_data;
+
+        format->u.audio.format = WG_AUDIO_FORMAT_AAC;
+
+        if (SUCCEEDED(IMFMediaType_GetBlobSize(type, &MF_MT_USER_DATA, &user_data_size)))
+        {
+            user_data = malloc(user_data_size);
+            if (SUCCEEDED(IMFMediaType_GetBlob(type, &MF_MT_USER_DATA, user_data, user_data_size, NULL)))
+            {
+                struct {
+                    WORD payload_type;
+                    WORD indication;
+                    WORD type;
+                    WORD reserved1;
+                    DWORD reserved2;
+                } *aac_info = (void *) user_data;
+
+                format->u.audio.compressed.aac.payload_type = aac_info->payload_type;
+                format->u.audio.compressed.aac.indication = aac_info->indication;
+
+                /* Audio specific config is stored at after HEAACWAVEINFO in MF_MT_USER_DATA
+                    https://docs.microsoft.com/en-us/windows/win32/api/mmreg/ns-mmreg-heaacwaveformat */
+                if (user_data_size > 12)
+                {
+                    user_data += 12;
+                    user_data_size -= 12;
+
+                    if (user_data_size > sizeof(format->u.audio.compressed.aac.audio_specifc_config))
+                    {
+                        FIXME("Encountered Audio-Specific-Config with a size larger than we support %u\n", user_data_size);
+                        user_data_size = sizeof(format->u.audio.compressed.aac.audio_specifc_config);
+                    }
+
+                    memcpy(format->u.audio.compressed.aac.audio_specifc_config, user_data, user_data_size);
+                    format->u.audio.compressed.aac.asp_size = user_data_size;
+                }
+
+            }
+        }
+
+        if (SUCCEEDED(IMFMediaType_GetUINT32(type, &MF_MT_AAC_PAYLOAD_TYPE, &payload_type)))
+            format->u.audio.compressed.aac.payload_type = payload_type;
+
+        if (SUCCEEDED(IMFMediaType_GetUINT32(type, &MF_MT_AAC_AUDIO_PROFILE_LEVEL_INDICATION, &indication)))
+            format->u.audio.compressed.aac.indication = indication;
+
+        return;
+    }
+
     for (i = 0; i < ARRAY_SIZE(audio_formats); ++i)
     {
         if (IsEqualGUID(&subtype, audio_formats[i].subtype) && depth == audio_formats[i].depth)
@@ -843,6 +881,17 @@ static void mf_media_type_to_wg_format_video(IMFMediaType *type, struct wg_forma
     }
     if (i == ARRAY_SIZE(video_formats))
         FIXME("Unrecognized video subtype %s.\n", debugstr_guid(&subtype));
+
+    if (format->u.video.format == WG_VIDEO_FORMAT_H264)
+    {
+        UINT32 profile, level;
+
+        if (SUCCEEDED(IMFMediaType_GetUINT32(type, &MF_MT_MPEG2_PROFILE, &profile)))
+            format->u.video.compressed.h264.profile = profile;
+
+        if (SUCCEEDED(IMFMediaType_GetUINT32(type, &MF_MT_MPEG2_LEVEL, &level)))
+            format->u.video.compressed.h264.level = level;
+    }
 }
 
 void mf_media_type_to_wg_format(IMFMediaType *type, struct wg_format *format)
@@ -881,11 +930,6 @@ static void mf_media_type_to_wg_encoded_format_xwma(IMFMediaType *type, struct w
         FIXME("Channel count is not set.\n");
         return;
     }
-    if (FAILED(IMFMediaType_GetUINT32(type, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, &bytes_per_second)))
-    {
-        FIXME("Bitrate is not set.\n");
-        return;
-    }
     if (FAILED(IMFMediaType_GetUINT32(type, &MF_MT_AUDIO_BLOCK_ALIGNMENT, &block_align)))
     {
         FIXME("Block alignment is not set.\n");
@@ -900,6 +944,11 @@ static void mf_media_type_to_wg_encoded_format_xwma(IMFMediaType *type, struct w
     {
         FIXME("Codec data is not set.\n");
         return;
+    }
+    if (FAILED(IMFMediaType_GetUINT32(type, &MF_MT_AUDIO_AVG_BYTES_PER_SECOND, &bytes_per_second)))
+    {
+        FIXME("Bitrate is not set.\n");
+        bytes_per_second = 0;
     }
 
     format->encoded_type = encoded_type;

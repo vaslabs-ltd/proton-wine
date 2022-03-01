@@ -9094,6 +9094,7 @@ static const IMFDXGIDeviceManagerVtbl dxgi_device_manager_vtbl =
 HRESULT WINAPI MFCreateDXGIDeviceManager(UINT *token, IMFDXGIDeviceManager **manager)
 {
     struct dxgi_device_manager *object;
+    const char *sgi = getenv("SteamGameId");
     const char *do_not_create = getenv("WINE_DO_NOT_CREATE_DXGI_DEVICE_MANAGER");
 
     TRACE("%p, %p.\n", token, manager);
@@ -9103,7 +9104,18 @@ HRESULT WINAPI MFCreateDXGIDeviceManager(UINT *token, IMFDXGIDeviceManager **man
      * #19126 is solved. Returning a DXGI device manager also breaks
      * Age of Empires Definitive Edition - this gameid should be removed
      * once CW bug #19741 is solved. */
-    if (do_not_create && do_not_create[0] != '\0')
+    if (sgi && (
+                strcmp(sgi, "305620") == 0 || /* The Long Dark */
+                strcmp(sgi, "1110100") == 0 || /* Power Rangers: Battle for the Grid */
+                strcmp(sgi, "1452500") == 0 || /* The Good Life */
+                strcmp(sgi, "1741410") == 0 || /* The Good Life Demo */
+                strcmp(sgi, "983970") == 0 || /* Haven */
+                strcmp(sgi, "585420") == 0 || /* Trailmakers */
+                strcmp(sgi, "684450") == 0 || /* Surviving the Aftermath */
+                strcmp(sgi, "1017900") == 0 || /* Age of Empires: Definitive Edition */
+                strcmp(sgi, "1331440") == 0 || /* FUSER */
+                (do_not_create && do_not_create[0] != '\0')
+               ))
     {
         FIXME("stubbing out\n");
         return E_NOTIMPL;

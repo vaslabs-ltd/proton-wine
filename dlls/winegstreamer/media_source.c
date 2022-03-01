@@ -357,7 +357,7 @@ static void start_pipeline(struct media_source *source, struct source_async_comm
             IMFMediaTypeHandler_GetCurrentMediaType(mth, &current_mt);
 
             mf_media_type_to_wg_format(current_mt, &format);
-            wg_parser_stream_enable(stream->wg_stream, &format, NULL, 0);
+            wg_parser_stream_enable(stream->wg_stream, &format, NULL);
 
             IMFMediaType_Release(current_mt);
             IMFMediaTypeHandler_Release(mth);
@@ -533,12 +533,6 @@ static void wait_on_sample(struct media_stream *stream, IUnknown *token)
     struct wg_parser_event event;
 
     TRACE("%p, %p\n", stream, token);
-
-    if (stream->eos)
-    {
-        IMFMediaEventQueue_QueueEventParamVar(stream->event_queue, MEError, &GUID_NULL, MF_E_END_OF_STREAM, &empty_var);
-        return;
-    }
 
     for (;;)
     {
@@ -878,7 +872,7 @@ static HRESULT new_media_stream(struct media_source *source,
 static HRESULT media_stream_init_desc(struct media_stream *stream)
 {
     IMFMediaTypeHandler *type_handler = NULL;
-    IMFMediaType *stream_types[8];
+    IMFMediaType *stream_types[7];
     struct wg_format format;
     DWORD type_count = 0;
     unsigned int i;
@@ -898,7 +892,6 @@ static HRESULT media_stream_init_desc(struct media_stream *stream)
             &MFVideoFormat_IYUV,
             &MFVideoFormat_I420,
             &MFVideoFormat_ARGB32,
-            &MFVideoFormat_RGB32,
         };
 
         IMFMediaType *base_type = mf_media_type_from_wg_format(&format);

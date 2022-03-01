@@ -218,7 +218,7 @@ static ULONG WINAPI h264_decoder_AddRef(IMFTransform *iface)
     struct h264_decoder *decoder = impl_from_IMFTransform(iface);
     ULONG refcount = InterlockedIncrement(&decoder->refcount);
 
-    TRACE("iface %p increasing refcount to %u.\n", decoder, refcount);
+    TRACE("iface %p increasing refcount to %lu.\n", decoder, refcount);
 
     return refcount;
 }
@@ -228,7 +228,7 @@ static ULONG WINAPI h264_decoder_Release(IMFTransform *iface)
     struct h264_decoder *decoder = impl_from_IMFTransform(iface);
     ULONG refcount = InterlockedDecrement(&decoder->refcount);
 
-    TRACE("iface %p decreasing refcount to %u.\n", decoder, refcount);
+    TRACE("iface %p decreasing refcount to %lu.\n", decoder, refcount);
 
     if (!refcount)
     {
@@ -261,7 +261,7 @@ static HRESULT WINAPI h264_decoder_GetStreamCount(IMFTransform *iface, DWORD *in
 static HRESULT WINAPI h264_decoder_GetStreamIDs(IMFTransform *iface, DWORD input_size, DWORD *inputs,
         DWORD output_size, DWORD *outputs)
 {
-    FIXME("iface %p, input_size %u, inputs %p, output_size %u, outputs %p stub!\n",
+    FIXME("iface %p, input_size %lu, inputs %p, output_size %lu, outputs %p stub!\n",
             iface, input_size, inputs, output_size, outputs);
     return E_NOTIMPL;
 }
@@ -270,7 +270,7 @@ static HRESULT WINAPI h264_decoder_GetInputStreamInfo(IMFTransform *iface, DWORD
 {
     struct h264_decoder *decoder = impl_from_IMFTransform(iface);
 
-    TRACE("iface %p, id %u, info %p.\n", iface, id, info);
+    TRACE("iface %p, id %#lx, info %p.\n", iface, id, info);
 
     if (!decoder->input_type)
         return MF_E_TRANSFORM_TYPE_NOT_SET;
@@ -288,9 +288,10 @@ static HRESULT WINAPI h264_decoder_GetOutputStreamInfo(IMFTransform *iface, DWOR
 {
     struct h264_decoder *decoder = impl_from_IMFTransform(iface);
     IMFMediaType *media_type;
+    UINT32 sample_size;
     HRESULT hr;
 
-    TRACE("iface %p, id %u, info %p.\n", iface, id, info);
+    TRACE("iface %p, id %#lx, info %p.\n", iface, id, info);
 
     if (!decoder->input_type || !decoder->output_type)
         return MF_E_TRANSFORM_TYPE_NOT_SET;
@@ -298,8 +299,9 @@ static HRESULT WINAPI h264_decoder_GetOutputStreamInfo(IMFTransform *iface, DWOR
     media_type = decoder->output_type;
 
     info->dwFlags = MFT_OUTPUT_STREAM_WHOLE_SAMPLES | MFT_OUTPUT_STREAM_SINGLE_SAMPLE_PER_BUFFER | MFT_OUTPUT_STREAM_FIXED_SAMPLE_SIZE;
-    if (FAILED(hr = IMFMediaType_GetUINT32(media_type, &MF_MT_SAMPLE_SIZE, &info->cbSize)))
-        info->cbSize = 1920 * 1080 * 2;
+    if (FAILED(hr = IMFMediaType_GetUINT32(media_type, &MF_MT_SAMPLE_SIZE, &sample_size)))
+        sample_size = 1920 * 1080 * 2;
+    info->cbSize = sample_size;
     info->cbAlignment = 0;
 
     return S_OK;
@@ -315,26 +317,26 @@ static HRESULT WINAPI h264_decoder_GetAttributes(IMFTransform *iface, IMFAttribu
 static HRESULT WINAPI h264_decoder_GetInputStreamAttributes(IMFTransform *iface, DWORD id,
         IMFAttributes **attributes)
 {
-    FIXME("iface %p, id %u, attributes %p stub!\n", iface, id, attributes);
+    FIXME("iface %p, id %#lx, attributes %p stub!\n", iface, id, attributes);
     return E_NOTIMPL;
 }
 
 static HRESULT WINAPI h264_decoder_GetOutputStreamAttributes(IMFTransform *iface, DWORD id,
         IMFAttributes **attributes)
 {
-    FIXME("iface %p, id %u, attributes %p stub!\n", iface, id, attributes);
+    FIXME("iface %p, id %#lx, attributes %p stub!\n", iface, id, attributes);
     return E_NOTIMPL;
 }
 
 static HRESULT WINAPI h264_decoder_DeleteInputStream(IMFTransform *iface, DWORD id)
 {
-    FIXME("iface %p, id %u stub!\n", iface, id);
+    FIXME("iface %p, id %#lx stub!\n", iface, id);
     return E_NOTIMPL;
 }
 
 static HRESULT WINAPI h264_decoder_AddInputStreams(IMFTransform *iface, DWORD streams, DWORD *ids)
 {
-    FIXME("iface %p, streams %u, ids %p stub!\n", iface, streams, ids);
+    FIXME("iface %p, streams %lu, ids %p stub!\n", iface, streams, ids);
     return E_NOTIMPL;
 }
 
@@ -345,7 +347,7 @@ static HRESULT WINAPI h264_decoder_GetInputAvailableType(IMFTransform *iface, DW
     const GUID *subtype;
     HRESULT hr;
 
-    TRACE("iface %p, id %u, index %u, type %p.\n", iface, id, index, type);
+    TRACE("iface %p, id %#lx, index %#lx, type %p.\n", iface, id, index, type);
 
     *type = NULL;
 
@@ -372,7 +374,7 @@ static HRESULT WINAPI h264_decoder_GetOutputAvailableType(IMFTransform *iface, D
     const GUID *output_type;
     HRESULT hr;
 
-    TRACE("iface %p, id %u, index %u, type %p.\n", iface, id, index, type);
+    TRACE("iface %p, id %#lx, index %#lx, type %p.\n", iface, id, index, type);
 
     if (!decoder->input_type)
         return MF_E_TRANSFORM_TYPE_NOT_SET;
@@ -408,7 +410,7 @@ static HRESULT WINAPI h264_decoder_SetInputType(IMFTransform *iface, DWORD id, I
     HRESULT hr;
     ULONG i;
 
-    TRACE("iface %p, id %u, type %p, flags %#x.\n", iface, id, type, flags);
+    TRACE("iface %p, id %#lx, type %p, flags %#lx.\n", iface, id, type, flags);
 
     if (FAILED(hr = IMFMediaType_GetGUID(type, &MF_MT_MAJOR_TYPE, &major)) ||
             FAILED(hr = IMFMediaType_GetGUID(type, &MF_MT_SUBTYPE, &subtype)))
@@ -444,7 +446,7 @@ static HRESULT WINAPI h264_decoder_SetOutputType(IMFTransform *iface, DWORD id, 
     HRESULT hr;
     ULONG i;
 
-    TRACE("iface %p, id %u, type %p, flags %#x.\n", iface, id, type, flags);
+    TRACE("iface %p, id %#lx, type %p, flags %#lx.\n", iface, id, type, flags);
 
     if (!decoder->input_type)
         return MF_E_TRANSFORM_TYPE_NOT_SET;
@@ -483,19 +485,19 @@ static HRESULT WINAPI h264_decoder_SetOutputType(IMFTransform *iface, DWORD id, 
 
 static HRESULT WINAPI h264_decoder_GetInputCurrentType(IMFTransform *iface, DWORD id, IMFMediaType **type)
 {
-    FIXME("iface %p, id %u, type %p stub!\n", iface, id, type);
+    FIXME("iface %p, id %#lx, type %p stub!\n", iface, id, type);
     return E_NOTIMPL;
 }
 
 static HRESULT WINAPI h264_decoder_GetOutputCurrentType(IMFTransform *iface, DWORD id, IMFMediaType **type)
 {
-    FIXME("iface %p, id %u, type %p stub!\n", iface, id, type);
+    FIXME("iface %p, id %#lx, type %p stub!\n", iface, id, type);
     return E_NOTIMPL;
 }
 
 static HRESULT WINAPI h264_decoder_GetInputStatus(IMFTransform *iface, DWORD id, DWORD *flags)
 {
-    FIXME("iface %p, id %u, flags %p stub!\n", iface, id, flags);
+    FIXME("iface %p, id %#lx, flags %p stub!\n", iface, id, flags);
     return E_NOTIMPL;
 }
 
@@ -514,7 +516,7 @@ static HRESULT WINAPI h264_decoder_SetOutputBounds(IMFTransform *iface, LONGLONG
 
 static HRESULT WINAPI h264_decoder_ProcessEvent(IMFTransform *iface, DWORD id, IMFMediaEvent *event)
 {
-    FIXME("iface %p, id %u, event %p stub!\n", iface, id, event);
+    FIXME("iface %p, id %#lx, event %p stub!\n", iface, id, event);
     return E_NOTIMPL;
 }
 
@@ -541,11 +543,11 @@ static HRESULT WINAPI h264_decoder_ProcessInput(IMFTransform *iface, DWORD id, I
     struct h264_decoder *decoder = impl_from_IMFTransform(iface);
     IMFMediaBuffer *media_buffer;
     MFT_INPUT_STREAM_INFO info;
-    UINT32 buffer_size;
+    DWORD buffer_size;
     BYTE *buffer;
     HRESULT hr;
 
-    TRACE("iface %p, id %u, sample %p, flags %#x.\n", iface, id, sample, flags);
+    TRACE("iface %p, id %#lx, sample %p, flags %#lx.\n", iface, id, sample, flags);
 
     if (FAILED(hr = IMFTransform_GetInputStreamInfo(iface, 0, &info)))
         return hr;
@@ -578,14 +580,15 @@ static HRESULT WINAPI h264_decoder_ProcessOutput(IMFTransform *iface, DWORD flag
     MFVideoArea aperture = {0};
     IMFMediaType *media_type;
     UINT32 align, offset;
+    DWORD buffer_size;
     UINT64 framerate;
     HRESULT hr;
 
-    TRACE("iface %p, flags %#x, count %u, samples %p, status %p.\n", iface, flags, count, samples, status);
+    TRACE("iface %p, flags %#lx, count %lu, samples %p, status %p.\n", iface, flags, count, samples, status);
 
     if (count > 1)
     {
-        FIXME("Not implemented count %u\n", count);
+        FIXME("Not implemented count %lu\n", count);
         return E_NOTIMPL;
     }
 
@@ -606,8 +609,9 @@ static HRESULT WINAPI h264_decoder_ProcessOutput(IMFTransform *iface, DWORD flag
     if (FAILED(hr = IMFSample_ConvertToContiguousBuffer(samples[0].pSample, &media_buffer)))
         return hr;
 
-    if (FAILED(hr = IMFMediaBuffer_Lock(media_buffer, &wg_sample.data, &wg_sample.size, NULL)))
+    if (FAILED(hr = IMFMediaBuffer_Lock(media_buffer, &wg_sample.data, &buffer_size, NULL)))
         goto done;
+    wg_sample.size = buffer_size;
 
     wg_sample.format = &decoder->wg_format;
     if (wg_sample.size < info.cbSize)

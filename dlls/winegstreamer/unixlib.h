@@ -62,9 +62,19 @@ struct wg_format
                 WG_VIDEO_FORMAT_YVYU,
 
                 WG_VIDEO_FORMAT_CINEPAK,
+
+                WG_VIDEO_FORMAT_H264,
             } format;
             int32_t width, height;
             uint32_t fps_n, fps_d;
+            union
+            {
+                struct
+                {
+                    uint32_t profile;
+                    uint32_t level;
+                } h264;
+            } compressed;
         } video;
         struct
         {
@@ -82,13 +92,37 @@ struct wg_format
                 WG_AUDIO_FORMAT_MPEG1_LAYER1,
                 WG_AUDIO_FORMAT_MPEG1_LAYER2,
                 WG_AUDIO_FORMAT_MPEG1_LAYER3,
+
+                WG_AUDIO_FORMAT_AAC,
             } format;
 
             uint32_t channels;
             uint32_t channel_mask; /* In WinMM format. */
             uint32_t rate;
+
+            union
+            {
+                struct
+                {
+                    uint32_t payload_type;
+                    uint32_t indication;
+                    /* The definition of this structure is found in ISO/IEC 14496-3,
+                       which we don't have access to, so we'll just keep
+                       the size set to the largest instance we've seen used. */
+                    unsigned char audio_specifc_config[2];
+                    uint32_t asp_size;
+                } aac;
+            } compressed;
         } audio;
     } u;
+};
+
+struct wg_rect
+{
+    uint32_t left;
+    uint32_t right;
+    uint32_t top;
+    uint32_t bottom;
 };
 
 struct wg_encoded_format
@@ -130,14 +164,6 @@ struct wg_encoded_format
             uint32_t level;
         } h264;
     } u;
-};
-
-struct wg_rect
-{
-    uint32_t left;
-    uint32_t right;
-    uint32_t top;
-    uint32_t bottom;
 };
 
 enum wg_parser_event_type
@@ -243,14 +269,11 @@ struct wg_parser_stream_get_preferred_format_params
     struct wg_format *format;
 };
 
-#define STREAM_ENABLE_FLAG_FLIP_RGB 0x1
-
 struct wg_parser_stream_enable_params
 {
     struct wg_parser_stream *stream;
     const struct wg_format *format;
     const struct wg_rect *aperture;
-    uint32_t flags;
 };
 
 struct wg_parser_stream_get_event_params
@@ -365,10 +388,10 @@ enum unix_funcs
     unix_wg_parser_stream_get_language,
     unix_wg_parser_stream_seek,
 
-    unix_wg_parser_stream_drain,
-
     unix_wg_transform_create,
     unix_wg_transform_destroy,
+
+    unix_wg_parser_stream_drain,
 
     unix_wg_transform_push_data,
     unix_wg_transform_read_data,

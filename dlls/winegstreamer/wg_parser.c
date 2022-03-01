@@ -412,11 +412,89 @@ static void wg_channel_mask_to_gst(GstAudioChannelPosition *positions, uint32_t 
     }
 }
 
+static void wg_set_caps_from_wg_format(GstCaps *caps, const struct wg_format *format)
+{
+    switch (format->major_type)
+    {
+        case WG_MAJOR_TYPE_VIDEO:
+        {
+            gst_caps_set_simple(caps, "width", G_TYPE_INT, format->u.video.width, NULL);
+            gst_caps_set_simple(caps, "height", G_TYPE_INT, format->u.video.height, NULL);
+            gst_caps_set_simple(caps, "framerate", GST_TYPE_FRACTION, format->u.video.fps_n, format->u.video.fps_d, NULL);
+            break;
+        }
+        case WG_MAJOR_TYPE_AUDIO:
+        {
+            gst_caps_set_simple(caps, "rate", G_TYPE_INT, format->u.audio.rate, NULL);
+            gst_caps_set_simple(caps, "channels", G_TYPE_INT, format->u.audio.channels, NULL);
+            if (format->u.audio.channel_mask)
+                gst_caps_set_simple(caps, "channel-mask", G_TYPE_INT, format->u.audio.channel_mask, NULL);
+        }
+        default:
+            break;
+    }
+}
+
 static GstCaps *wg_format_to_caps_audio(const struct wg_format *format)
 {
     GstAudioChannelPosition positions[32];
     GstAudioFormat audio_format;
     GstAudioInfo info;
+
+    /* compressed types */
+
+    if (format->u.audio.format == WG_AUDIO_FORMAT_AAC)
+    {
+        const char *profile, *level;
+        GstBuffer *audio_specific_config;
+        GstCaps *caps = gst_caps_new_empty_simple("audio/mpeg");
+        wg_set_caps_from_wg_format(caps, format);
+
+        gst_caps_set_simple(caps, "mpegversion", G_TYPE_INT, 4, NULL);
+
+        switch (format->u.audio.compressed.aac.payload_type)
+        {
+            case 0:
+                gst_caps_set_simple(caps, "stream-format", G_TYPE_STRING, "raw", NULL);
+                break;
+            case 1:
+                gst_caps_set_simple(caps, "stream-format", G_TYPE_STRING, "adts", NULL);
+                break;
+            case 2:
+                gst_caps_set_simple(caps, "stream-format", G_TYPE_STRING, "adif", NULL);
+                break;
+            case 3:
+                gst_caps_set_simple(caps, "stream-format", G_TYPE_STRING, "loas", NULL);
+                break;
+            default:
+                gst_caps_set_simple(caps, "stream-format", G_TYPE_STRING, "raw", NULL);
+        };
+
+        switch (format->u.audio.compressed.aac.indication)
+        {
+            case 0x29: profile = "lc"; level = "2";  break;
+            case 0x2A: profile = "lc"; level = "4"; break;
+            case 0x2B: profile = "lc"; level = "5"; break;
+            default:
+                GST_FIXME("Unrecognized profile-level-indication %u\n", format->u.audio.compressed.aac.indication);
+                /* fallthrough */
+            case 0x00: case 0xFE: profile = level = NULL; break; /* unspecified */
+        }
+
+        if (profile)
+            gst_caps_set_simple(caps, "profile", G_TYPE_STRING, profile, NULL);
+        if (level)
+            gst_caps_set_simple(caps, "level", G_TYPE_STRING, level, NULL);
+
+        audio_specific_config = gst_buffer_new_allocate(NULL, format->u.audio.compressed.aac.asp_size, NULL);
+        gst_buffer_fill(audio_specific_config, 0, format->u.audio.compressed.aac.audio_specifc_config, format->u.audio.compressed.aac.asp_size);
+        gst_caps_set_simple(caps, "codec_data", GST_TYPE_BUFFER, audio_specific_config, NULL);
+        gst_buffer_unref(audio_specific_config);
+
+        return caps;
+    }
+
+    /* uncompressed_types */
 
     if ((audio_format = wg_audio_format_to_gst(format->u.audio.format)) == GST_AUDIO_FORMAT_UNKNOWN)
         return NULL;
@@ -452,6 +530,65 @@ static GstCaps *wg_format_to_caps_video(const struct wg_format *format)
     GstVideoInfo info;
     unsigned int i;
     GstCaps *caps;
+
+    /* compressed types */
+
+    if (format->u.video.format == WG_VIDEO_FORMAT_H264)
+    {
+        const char *profile;
+        const char *level;
+
+        caps = gst_caps_new_empty_simple("video/x-h264");
+        wg_set_caps_from_wg_format(caps, format);
+
+        gst_caps_set_simple(caps, "stream-format", G_TYPE_STRING, "byte-stream", NULL);
+        gst_caps_set_simple(caps, "alignment", G_TYPE_STRING, "au", NULL);
+
+        switch (format->u.video.compressed.h264.profile)
+        {
+            case /* eAVEncH264VProfile_Main */ 77:  profile = "main"; break;
+            case /* eAVEncH264VProfile_High */ 100: profile = "high"; break;
+            case /* eAVEncH264VProfile_444 */  244: profile = "high-4:4:4"; break;
+            default:
+                GST_ERROR("Unrecognized H.264 profile attribute %u\n", format->u.video.compressed.h264.profile);
+                /* fallthrough */
+            case 0: profile = NULL;
+        }
+
+        switch (format->u.video.compressed.h264.level)
+        {
+            case /* eAVEncH264VLevel1 */   10: level = "1";   break;
+            case /* eAVEncH264VLevel1_1 */ 11: level = "1.1"; break;
+            case /* eAVEncH264VLevel1_2 */ 12: level = "1.2"; break;
+            case /* eAVEncH264VLevel1_3 */ 13: level = "1.3"; break;
+            case /* eAVEncH264VLevel2 */   20: level = "2";   break;
+            case /* eAVEncH264VLevel2_1 */ 21: level = "2.1"; break;
+            case /* eAVEncH264VLevel2_2 */ 22: level = "2.2"; break;
+            case /* eAVEncH264VLevel3 */   30: level = "3";   break;
+            case /* eAVEncH264VLevel3_1 */ 31: level = "3.1"; break;
+            case /* eAVEncH264VLevel3_2 */ 32: level = "3.2"; break;
+            case /* eAVEncH264VLevel4 */   40: level = "4";   break;
+            case /* eAVEncH264VLevel4_1 */ 41: level = "4.1"; break;
+            case /* eAVEncH264VLevel4_2 */ 42: level = "4.2"; break;
+            case /* eAVEncH264VLevel5 */   50: level = "5";   break;
+            case /* eAVEncH264VLevel5_1 */ 51: level = "5.1"; break;
+            case /* eAVEncH264VLevel5_2 */ 52: level = "5.2"; break;
+            default:
+                GST_ERROR("Unrecognized H.264 level attribute %u\n", format->u.video.compressed.h264.level);
+                /* fallthrough */
+            case 0: level = NULL;
+        }
+
+        if (profile)
+            gst_caps_set_simple(caps, "profile", G_TYPE_STRING, profile, NULL);
+
+        if (level)
+            gst_caps_set_simple(caps, "level", G_TYPE_STRING, level, NULL);
+
+        return caps;
+    }
+
+    /* uncompressed types */
 
     if ((video_format = wg_video_format_to_gst(format->u.video.format)) == GST_VIDEO_FORMAT_UNKNOWN)
         return NULL;
@@ -669,34 +806,32 @@ static NTSTATUS wg_parser_stream_enable(void *args)
 
     if (format->major_type == WG_MAJOR_TYPE_VIDEO)
     {
-        if (params->flags & STREAM_ENABLE_FLAG_FLIP_RGB)
+        bool flip = (format->u.video.height < 0);
+
+        switch (format->u.video.format)
         {
-            bool flip = (format->u.video.height < 0);
+            case WG_VIDEO_FORMAT_BGRA:
+            case WG_VIDEO_FORMAT_BGRx:
+            case WG_VIDEO_FORMAT_BGR:
+            case WG_VIDEO_FORMAT_RGB15:
+            case WG_VIDEO_FORMAT_RGB16:
+                flip = !flip;
+                break;
 
-            switch (format->u.video.format)
-            {
-                case WG_VIDEO_FORMAT_BGRA:
-                case WG_VIDEO_FORMAT_BGRx:
-                case WG_VIDEO_FORMAT_BGR:
-                case WG_VIDEO_FORMAT_RGB15:
-                case WG_VIDEO_FORMAT_RGB16:
-                    flip = !flip;
-                    break;
-
-                case WG_VIDEO_FORMAT_AYUV:
-                case WG_VIDEO_FORMAT_I420:
-                case WG_VIDEO_FORMAT_NV12:
-                case WG_VIDEO_FORMAT_UYVY:
-                case WG_VIDEO_FORMAT_YUY2:
-                case WG_VIDEO_FORMAT_YV12:
-                case WG_VIDEO_FORMAT_YVYU:
-                case WG_VIDEO_FORMAT_UNKNOWN:
-                case WG_VIDEO_FORMAT_CINEPAK:
-                    break;
-            }
-
-            gst_util_set_object_arg(G_OBJECT(stream->flip), "method", flip ? "vertical-flip" : "none");
+            case WG_VIDEO_FORMAT_AYUV:
+            case WG_VIDEO_FORMAT_I420:
+            case WG_VIDEO_FORMAT_NV12:
+            case WG_VIDEO_FORMAT_UYVY:
+            case WG_VIDEO_FORMAT_YUY2:
+            case WG_VIDEO_FORMAT_YV12:
+            case WG_VIDEO_FORMAT_YVYU:
+            case WG_VIDEO_FORMAT_UNKNOWN:
+            case WG_VIDEO_FORMAT_CINEPAK:
+            case WG_VIDEO_FORMAT_H264:
+                break;
         }
+
+        gst_util_set_object_arg(G_OBJECT(stream->flip), "method", flip ? "vertical-flip" : "none");
 
         if (aperture)
         {
@@ -1410,9 +1545,6 @@ static void pad_added_cb(GstElement *element, GstPad *pad, gpointer user)
          * to do the final conversion. */
         if (!(vconv2 = create_element("videoconvert", "base")))
             goto out;
-
-        /* Let GStreamer choose a default number of threads. */
-        gst_util_set_object_arg(G_OBJECT(vconv2), "n-threads", "0");
 
         if (!parser->seekable)
         {
@@ -2662,10 +2794,10 @@ const unixlib_entry_t __wine_unix_call_funcs[] =
     X(wg_parser_stream_get_language),
     X(wg_parser_stream_seek),
 
-    X(wg_parser_stream_drain),
-
     X(wg_transform_create),
     X(wg_transform_destroy),
+
+    X(wg_parser_stream_drain),
 
     X(wg_transform_push_data),
     X(wg_transform_read_data),

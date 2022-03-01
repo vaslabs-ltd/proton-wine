@@ -82,7 +82,7 @@ uint32_t wg_parser_get_stream_count(struct wg_parser *parser) DECLSPEC_HIDDEN;
 struct wg_parser_stream *wg_parser_get_stream(struct wg_parser *parser, uint32_t index) DECLSPEC_HIDDEN;
 
 void wg_parser_stream_get_preferred_format(struct wg_parser_stream *stream, struct wg_format *format) DECLSPEC_HIDDEN;
-void wg_parser_stream_enable(struct wg_parser_stream *stream, const struct wg_format *format, const struct wg_rect *aperture, uint32_t flags) DECLSPEC_HIDDEN;
+void wg_parser_stream_enable(struct wg_parser_stream *stream, const struct wg_format *format, const struct wg_rect *aperture) DECLSPEC_HIDDEN;
 void wg_parser_stream_disable(struct wg_parser_stream *stream) DECLSPEC_HIDDEN;
 
 bool wg_parser_stream_get_event(struct wg_parser_stream *stream, struct wg_parser_event *event) DECLSPEC_HIDDEN;
@@ -112,7 +112,6 @@ HRESULT avi_splitter_create(IUnknown *outer, IUnknown **out) DECLSPEC_HIDDEN;
 HRESULT decodebin_parser_create(IUnknown *outer, IUnknown **out) DECLSPEC_HIDDEN;
 HRESULT mpeg_splitter_create(IUnknown *outer, IUnknown **out) DECLSPEC_HIDDEN;
 HRESULT wave_parser_create(IUnknown *outer, IUnknown **out) DECLSPEC_HIDDEN;
-HRESULT wma_decoder_create(IUnknown *outer, IUnknown **out) DECLSPEC_HIDDEN;
 
 bool amt_from_wg_format(AM_MEDIA_TYPE *mt, const struct wg_format *format, bool wm);
 bool amt_to_wg_format(const AM_MEDIA_TYPE *mt, struct wg_format *format);
@@ -129,6 +128,7 @@ void mf_media_type_to_wg_encoded_format(IMFMediaType *type, struct wg_encoded_fo
 HRESULT winegstreamer_stream_handler_create(REFIID riid, void **obj) DECLSPEC_HIDDEN;
 
 HRESULT aac_decoder_create(REFIID riid, void **ret) DECLSPEC_HIDDEN;
+HRESULT wma_decoder_create(REFIID riid, void **ret) DECLSPEC_HIDDEN;
 HRESULT h264_decoder_create(REFIID riid, void **ret) DECLSPEC_HIDDEN;
 HRESULT audio_converter_create(REFIID riid, void **ret) DECLSPEC_HIDDEN;
 HRESULT color_converter_create(REFIID riid, void **ret) DECLSPEC_HIDDEN;
