@@ -131,6 +131,17 @@ static void to_sRGB(BYTE *bgr)
 }
 #endif
 
+static BOOL is_indexed_format(const GUID *format)
+{
+    if (IsEqualGUID(format, &GUID_WICPixelFormat1bppIndexed) ||
+        IsEqualGUID(format, &GUID_WICPixelFormat2bppIndexed) ||
+        IsEqualGUID(format, &GUID_WICPixelFormat4bppIndexed) ||
+        IsEqualGUID(format, &GUID_WICPixelFormat8bppIndexed))
+        return TRUE;
+
+    return FALSE;
+}
+
 static inline FormatConverter *impl_from_IWICFormatConverter(IWICFormatConverter *iface)
 {
     return CONTAINING_RECORD(iface, FormatConverter, IWICFormatConverter_iface);
@@ -1703,7 +1714,10 @@ static HRESULT WINAPI FormatConverter_Initialize(IWICFormatConverter *iface,
         case WICBitmapPaletteTypeCustom:
             IWICPalette_Release(palette);
             palette = NULL;
-            if (bpp <= 8) return E_INVALIDARG;
+
+            /* Indexed types require a palette */
+            if (is_indexed_format(dstFormat))
+                return E_INVALIDARG;
             break;
 
         case WICBitmapPaletteTypeMedianCut:

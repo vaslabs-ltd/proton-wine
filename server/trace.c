@@ -1487,8 +1487,6 @@ static void dump_init_process_done_request( const struct init_process_done_reque
     dump_uint64( " teb=", &req->teb );
     dump_uint64( ", peb=", &req->peb );
     dump_uint64( ", ldt_copy=", &req->ldt_copy );
-    dump_uint64( ", kernel_stack=", &req->kernel_stack );
-    fprintf( stderr, ", kernel_stack_size=%08x", req->kernel_stack_size );
 }
 
 static void dump_init_process_done_reply( const struct init_process_done_reply *req )
@@ -1525,8 +1523,6 @@ static void dump_init_thread_request( const struct init_thread_request *req )
     fprintf( stderr, ", wait_fd=%d", req->wait_fd );
     dump_uint64( ", teb=", &req->teb );
     dump_uint64( ", entry=", &req->entry );
-    dump_uint64( ", kernel_stack=", &req->kernel_stack );
-    fprintf( stderr, ", kernel_stack_size=%08x", req->kernel_stack_size );
 }
 
 static void dump_init_thread_reply( const struct init_thread_reply *req )
@@ -2103,14 +2099,14 @@ static void dump_recv_socket_request( const struct recv_socket_request *req )
 {
     fprintf( stderr, " oob=%d", req->oob );
     dump_async_data( ", async=", &req->async );
-    fprintf( stderr, ", force_async=%d", req->force_async );
+    fprintf( stderr, ", status=%08x", req->status );
+    fprintf( stderr, ", total=%08x", req->total );
 }
 
 static void dump_recv_socket_reply( const struct recv_socket_reply *req )
 {
     fprintf( stderr, " wait=%04x", req->wait );
     fprintf( stderr, ", options=%08x", req->options );
-    fprintf( stderr, ", nonblocking=%d", req->nonblocking );
 }
 
 static void dump_send_socket_request( const struct send_socket_request *req )
@@ -2828,18 +2824,6 @@ static void dump_get_async_result_reply( const struct get_async_result_reply *re
     dump_varargs_bytes( " out_data=", cur_size );
 }
 
-static void dump_set_async_direct_result_request( const struct set_async_direct_result_request *req )
-{
-    fprintf( stderr, " handle=%04x", req->handle );
-    dump_uint64( ", information=", &req->information );
-    fprintf( stderr, ", status=%08x", req->status );
-}
-
-static void dump_set_async_direct_result_reply( const struct set_async_direct_result_reply *req )
-{
-    fprintf( stderr, " handle=%04x", req->handle );
-}
-
 static void dump_read_request( const struct read_request *req )
 {
     dump_async_data( " async=", &req->async );
@@ -3502,6 +3486,7 @@ static void dump_set_focus_window_reply( const struct set_focus_window_reply *re
 static void dump_set_active_window_request( const struct set_active_window_request *req )
 {
     fprintf( stderr, " handle=%08x", req->handle );
+    fprintf( stderr, ", internal_msg=%08x", req->internal_msg );
 }
 
 static void dump_set_active_window_reply( const struct set_active_window_reply *req )
@@ -4668,21 +4653,6 @@ static void dump_get_fsync_apc_idx_reply( const struct get_fsync_apc_idx_reply *
     fprintf( stderr, " shm_idx=%08x", req->shm_idx );
 }
 
-static void dump_init_working_set_watch_request( const struct init_working_set_watch_request *req )
-{
-    fprintf( stderr, " fd=%d", req->fd );
-}
-
-static void dump_get_ws_watches_request( const struct get_ws_watches_request *req )
-{
-    fprintf( stderr, " process=%04x", req->process );
-}
-
-static void dump_get_ws_watches_reply( const struct get_ws_watches_reply *req )
-{
-    dump_varargs_ws_watch_data( " info=", cur_size );
-}
-
 static const dump_func req_dumpers[REQ_NB_REQUESTS] = {
     (dump_func)dump_new_process_request,
     (dump_func)dump_get_new_process_info_request,
@@ -4807,7 +4777,6 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] = {
     (dump_func)dump_register_async_request,
     (dump_func)dump_cancel_async_request,
     (dump_func)dump_get_async_result_request,
-    (dump_func)dump_set_async_direct_result_request,
     (dump_func)dump_read_request,
     (dump_func)dump_write_request,
     (dump_func)dump_ioctl_request,
@@ -4970,8 +4939,6 @@ static const dump_func req_dumpers[REQ_NB_REQUESTS] = {
     (dump_func)dump_get_fsync_idx_request,
     (dump_func)dump_fsync_msgwait_request,
     (dump_func)dump_get_fsync_apc_idx_request,
-    (dump_func)dump_init_working_set_watch_request,
-    (dump_func)dump_get_ws_watches_request,
 };
 
 static const dump_func reply_dumpers[REQ_NB_REQUESTS] = {
@@ -5098,7 +5065,6 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] = {
     NULL,
     NULL,
     (dump_func)dump_get_async_result_reply,
-    (dump_func)dump_set_async_direct_result_reply,
     (dump_func)dump_read_reply,
     (dump_func)dump_write_reply,
     (dump_func)dump_ioctl_reply,
@@ -5261,8 +5227,6 @@ static const dump_func reply_dumpers[REQ_NB_REQUESTS] = {
     (dump_func)dump_get_fsync_idx_reply,
     NULL,
     (dump_func)dump_get_fsync_apc_idx_reply,
-    NULL,
-    (dump_func)dump_get_ws_watches_reply,
 };
 
 static const char * const req_names[REQ_NB_REQUESTS] = {
@@ -5389,7 +5353,6 @@ static const char * const req_names[REQ_NB_REQUESTS] = {
     "register_async",
     "cancel_async",
     "get_async_result",
-    "set_async_direct_result",
     "read",
     "write",
     "ioctl",
@@ -5552,8 +5515,6 @@ static const char * const req_names[REQ_NB_REQUESTS] = {
     "get_fsync_idx",
     "fsync_msgwait",
     "get_fsync_apc_idx",
-    "init_working_set_watch",
-    "get_ws_watches",
 };
 
 static const struct
@@ -5669,7 +5630,6 @@ static const struct
     { "PIPE_EMPTY",                  STATUS_PIPE_EMPTY },
     { "PIPE_LISTENING",              STATUS_PIPE_LISTENING },
     { "PIPE_NOT_AVAILABLE",          STATUS_PIPE_NOT_AVAILABLE },
-    { "PORT_ALREADY_SET",            STATUS_PORT_ALREADY_SET },
     { "PORT_NOT_SET",                STATUS_PORT_NOT_SET },
     { "PREDEFINED_HANDLE",           STATUS_PREDEFINED_HANDLE },
     { "PRIVILEGE_NOT_HELD",          STATUS_PRIVILEGE_NOT_HELD },

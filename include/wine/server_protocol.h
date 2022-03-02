@@ -14,7 +14,6 @@
 
 #include <windef.h>
 #include <winbase.h>
-#include <winternl.h>
 
 typedef unsigned int obj_handle_t;
 typedef unsigned int user_handle_t;
@@ -471,8 +470,7 @@ enum apc_type
     APC_MAP_VIEW,
     APC_UNMAP_VIEW,
     APC_CREATE_THREAD,
-    APC_DUP_HANDLE,
-    APC_PROCESS_SET_INFO,
+    APC_DUP_HANDLE
 };
 
 typedef struct
@@ -581,11 +579,6 @@ typedef union
         unsigned int     attributes;
         unsigned int     options;
     } dup_handle;
-    struct
-    {
-        enum apc_type    type;
-        PROCESSINFOCLASS class;
-    } process_set_info;
 } apc_call_t;
 
 typedef union
@@ -684,11 +677,6 @@ typedef union
         enum apc_type    type;
         unsigned int     status;
     } break_process;
-    struct
-    {
-        enum apc_type    type;
-        unsigned int     status;
-    } process_set_info;
 } apc_result_t;
 
 enum irp_type
@@ -841,21 +829,6 @@ struct shared_cursor
     rectangle_t          clip;
 };
 
-struct ws_watch_entry
-{
-    client_ptr_t va;
-    client_ptr_t pc;
-    thread_id_t  tid;
-    int        __pad;
-};
-
-struct ws_watch_data
-{
-    data_size_t           len;
-    int                  __pad;
-    struct ws_watch_entry entries[1];
-};
-
 struct desktop_shared_memory
 {
     unsigned int         seq;
@@ -989,9 +962,6 @@ struct init_process_done_request
     client_ptr_t teb;
     client_ptr_t peb;
     client_ptr_t ldt_copy;
-    client_ptr_t kernel_stack;
-    unsigned int kernel_stack_size;
-    char __pad_52[4];
 };
 struct init_process_done_reply
 {
@@ -1036,9 +1006,6 @@ struct init_thread_request
     int          wait_fd;
     client_ptr_t teb;
     client_ptr_t entry;
-    client_ptr_t kernel_stack;
-    unsigned int kernel_stack_size;
-    char __pad_52[4];
 };
 struct init_thread_reply
 {
@@ -1839,16 +1806,14 @@ struct recv_socket_request
     struct request_header __header;
     int          oob;
     async_data_t async;
-    int          force_async;
-    char __pad_60[4];
+    unsigned int status;
+    unsigned int total;
 };
 struct recv_socket_reply
 {
     struct reply_header __header;
     obj_handle_t wait;
     unsigned int options;
-    int          nonblocking;
-    char __pad_20[4];
 };
 
 
@@ -2984,23 +2949,6 @@ struct get_async_result_reply
 
 
 
-struct set_async_direct_result_request
-{
-    struct request_header __header;
-    obj_handle_t   handle;
-    apc_param_t    information;
-    unsigned int   status;
-    char __pad_28[4];
-};
-struct set_async_direct_result_reply
-{
-    struct reply_header __header;
-    obj_handle_t   handle;
-    char __pad_12[4];
-};
-
-
-
 struct read_request
 {
     struct request_header __header;
@@ -3963,6 +3911,8 @@ struct set_active_window_request
 {
     struct request_header __header;
     user_handle_t  handle;
+    unsigned int   internal_msg;
+    char __pad_20[4];
 };
 struct set_active_window_reply
 {
@@ -5700,29 +5650,6 @@ struct get_fsync_apc_idx_reply
 };
 
 
-struct init_working_set_watch_request
-{
-    struct request_header __header;
-    int         fd;
-};
-struct init_working_set_watch_reply
-{
-    struct reply_header __header;
-};
-
-
-struct get_ws_watches_request
-{
-    struct request_header __header;
-    obj_handle_t process;
-};
-struct get_ws_watches_reply
-{
-    struct reply_header __header;
-    /* VARARG(info,ws_watch_data); */
-};
-
-
 enum request
 {
     REQ_new_process,
@@ -5848,7 +5775,6 @@ enum request
     REQ_register_async,
     REQ_cancel_async,
     REQ_get_async_result,
-    REQ_set_async_direct_result,
     REQ_read,
     REQ_write,
     REQ_ioctl,
@@ -6011,8 +5937,6 @@ enum request
     REQ_get_fsync_idx,
     REQ_fsync_msgwait,
     REQ_get_fsync_apc_idx,
-    REQ_init_working_set_watch,
-    REQ_get_ws_watches,
     REQ_NB_REQUESTS
 };
 
@@ -6143,7 +6067,6 @@ union generic_request
     struct register_async_request register_async_request;
     struct cancel_async_request cancel_async_request;
     struct get_async_result_request get_async_result_request;
-    struct set_async_direct_result_request set_async_direct_result_request;
     struct read_request read_request;
     struct write_request write_request;
     struct ioctl_request ioctl_request;
@@ -6306,8 +6229,6 @@ union generic_request
     struct get_fsync_idx_request get_fsync_idx_request;
     struct fsync_msgwait_request fsync_msgwait_request;
     struct get_fsync_apc_idx_request get_fsync_apc_idx_request;
-    struct init_working_set_watch_request init_working_set_watch_request;
-    struct get_ws_watches_request get_ws_watches_request;
 };
 union generic_reply
 {
@@ -6436,7 +6357,6 @@ union generic_reply
     struct register_async_reply register_async_reply;
     struct cancel_async_reply cancel_async_reply;
     struct get_async_result_reply get_async_result_reply;
-    struct set_async_direct_result_reply set_async_direct_result_reply;
     struct read_reply read_reply;
     struct write_reply write_reply;
     struct ioctl_reply ioctl_reply;
@@ -6599,13 +6519,11 @@ union generic_reply
     struct get_fsync_idx_reply get_fsync_idx_reply;
     struct fsync_msgwait_reply fsync_msgwait_reply;
     struct get_fsync_apc_idx_reply get_fsync_apc_idx_reply;
-    struct init_working_set_watch_reply init_working_set_watch_reply;
-    struct get_ws_watches_reply get_ws_watches_reply;
 };
 
 /* ### protocol_version begin ### */
 
-#define SERVER_PROTOCOL_VERSION 740
+#define SERVER_PROTOCOL_VERSION 741
 
 /* ### protocol_version end ### */
 
