@@ -23,6 +23,14 @@
 extern "C" {
 #endif
 
+typedef enum _THREAD_INFORMATION_CLASS {
+    ThreadMemoryPriority,
+    ThreadAbsoluteCpuPriority,
+    ThreadDynamicCodePolicy,
+    ThreadPowerThrottling,
+    ThreadInformationClassMax
+} THREAD_INFORMATION_CLASS;
+
 WINBASEAPI HRESULT WINAPI GetThreadDescription(HANDLE,PWSTR *);
 WINBASEAPI HRESULT WINAPI SetThreadDescription(HANDLE,PCWSTR);
 

@@ -143,6 +143,23 @@ BOOL WINAPI GetThreadSelectorEntry( HANDLE thread, DWORD sel, LDT_ENTRY *ldtent 
 
 
 /***********************************************************************
+ *           SetThreadInformation   (KERNEL32.@)
+ */
+BOOL SetThreadInformation(HANDLE hThread,
+                           THREAD_INFORMATION_CLASS threadInformationClass,
+                           LPVOID threadInformation,
+                           DWORD threadInformationSize)
+{
+    FIXME("(%p, %u, %p, %u): stub\n",
+         hThread,
+         threadInformationClass,
+         threadInformation,
+         threadInformationSize);
+    return TRUE;
+}
+
+
+/***********************************************************************
  * GetCurrentThread [KERNEL32.@]  Gets pseudohandle for current thread
  *
  * RETURNS
