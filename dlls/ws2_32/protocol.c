@@ -169,7 +169,7 @@ int WINAPI getaddrinfo( const char *node, const char *service,
 
     if (node)
     {
-        if (!strcmp(node, "download-alt.easyanticheat.net"))
+        if (!strcmp(node, "download-alt.easyanticheat.net") || !strcmp(node, "modules-cdn.eac-prod.on.epicgames.com"))
         {
             ERR("HACK: failing download-alt.easyanticheat.net resolution.\n");
             SetLastError(WSAHOST_NOT_FOUND);
@@ -933,7 +933,7 @@ struct hostent * WINAPI gethostbyname( const char *name )
         return NULL;
     }
 
-    if (name && !strcmp(name, "download-alt.easyanticheat.net"))
+    if (name && (!strcmp(name, "download-alt.easyanticheat.net") || !strcmp(name, "modules-cdn.eac-prod.on.epicgames.com")))
     {
         ERR("HACK: failing download-alt.easyanticheat.net resolution.\n");
         SetLastError( WSAHOST_NOT_FOUND );
