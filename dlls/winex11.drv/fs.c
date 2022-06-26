@@ -85,6 +85,45 @@ static struct fs_monitor_size fs_monitor_sizes[] =
     {1280, 1024}, /*  5:4 */
 };
 
+
+/* NOTE: THESE RESOLUTIONS WILL ONLY SHOW UP IN *FULLSCREEN* MODE */
+static struct fs_monitor_size fsr4k_sizes[] =
+{
+    //{1920, 1080},  /* 16:9 - 'FSR 2160p Performance' -- already a default 16:9 resolution */
+    {2259, 1270}, /* 16:9 - 'FSR 2160p Balanced' */
+    //{2560, 1440},  /* 16:9 - 'FSR 2160p Quality' -- already a default 16:9 resolution */
+    {2954, 1662}, /* 16:9 - 'FSR 2160p Ultra Quality' */
+};
+
+/* NOTE: THESE RESOLUTIONS WILL ONLY SHOW UP IN *FULLSCREEN* MODE */
+static struct fs_monitor_size fsruw_sizes[] =
+{
+    {1720, 720}, /* 21:9 - 'FSR ultra-wide Performance' */
+    {2024, 847}, /* 21:9 - 'FSR ultra-wide Balanced' */
+    {2293, 960}, /* 21:9 - 'FSR ultra-wide Quality' */
+    {2646, 1108}, /* 21:9 - 'FSR ultra-wide Ultra Quality' */
+};
+
+/* NOTE: THESE RESOLUTIONS WILL ONLY SHOW UP IN *FULLSCREEN* MODE */
+static struct fs_monitor_size fsr2k_sizes[] =
+{
+    //{1280, 720},  /* 16:9 - 'FSR 1440p Performance' -- already a default 16:9 resolution */
+    {1506, 847},  /* 16:9 - 'FSR 1440p Balanced' */
+    {1706, 960},  /* 16:9 - 'FSR 1440p Quality' */
+    {1970, 1108}, /* 16:9 - 'FSR 1440p Ultra Quality' */
+};
+
+/* NOTE: THESE RESOLUTIONS WILL ONLY SHOW UP IN *FULLSCREEN* MODE */
+static struct fs_monitor_size fsr1080_sizes[] =
+{
+    //{960, 640},  /* 16:9 - 'FSR 1080p Performance' */
+    {1129, 635},  /* 16:9 - 'FSR 1080p Balanced' */
+    //{1280, 720},  /* 16:9 - 'FSR 1080p Quality' -- already a default 16:9 resolution */    
+    {1477, 831},  /* 16:9 - 'FSR 1080p Ultra Quality' */
+};
+
+static struct fs_monitor_size fake_current_resolution;
+
 /* A fake monitor for the fullscreen hack */
 struct fs_monitor
 {
@@ -178,7 +217,24 @@ static BOOL fs_monitor_add_modes(struct fs_monitor *fs_monitor)
     /* Fullscreen hack doesn't support changing display orientations */
     if (!real_settings_handler.get_modes(real_id, 0, &real_modes, &real_mode_count))
         return FALSE;
-
+    
+    if (current_mode.dmPelsWidth >= 1129 && current_mode.dmPelsWidth <= 1920) {
+        /* 1080p FSR resolutions */
+        memcpy(fs_monitor_sizes+sizeof(fsr1080_sizes),fsr1080_sizes,sizeof(fsr1080_sizes));
+    } else if (current_mode.dmPelsWidth <= 2560) {
+        /* 1440p FSR resolutions */
+        memcpy(fs_monitor_sizes+sizeof(fsr2k_sizes),fsr2k_sizes,sizeof(fsr2k_sizes));
+    } else if (current_mode.dmPelsWidth <= 3440) {
+        /* ultrawide FSR resolutions */
+        memcpy(fs_monitor_sizes+sizeof(fsruw_sizes),fsruw_sizes,sizeof(fsruw_sizes));
+    } else if (current_mode.dmPelsWidth <= 3840) {
+        /* 4k FSR resolutions */
+        memcpy(fs_monitor_sizes+sizeof(fsr4k_sizes),fsr4k_sizes,sizeof(fsr4k_sizes));
+    } else {
+        /* Provide largetst available fsr resolutions for monitors with larget than 4k width */
+        memcpy(fs_monitor_sizes+sizeof(fsr4k_sizes),fsr4k_sizes,sizeof(fsr4k_sizes));
+    }
+        
     fs_monitor->mode_count = 0;
     fs_monitor->unique_resolutions = 0;
     fs_monitor->modes = heap_calloc(ARRAY_SIZE(fs_monitor_sizes) * DEPTH_COUNT + real_mode_count,
@@ -533,6 +589,28 @@ BOOL fs_hack_is_integer(void)
     }
     TRACE("is_interger_scaling: %s\n", is_int ? "TRUE" : "FALSE");
     return is_int;
+}
+
+BOOL fs_hack_is_fsr(float *sharpness)
+{
+    static int is_fsr = -1;
+    int sharpness_int = 2;
+    if (is_fsr < 0)
+    {
+        const char *e = getenv("WINE_FULLSCREEN_FSR");
+        is_fsr = e && strcmp(e, "0");
+    }
+    if (sharpness)
+    {
+        const char *e = getenv("WINE_FULLSCREEN_FSR_STRENGTH");
+        if (e)
+        {
+            sharpness_int = atoi(e);
+        }
+        *sharpness = (float) sharpness_int / 10.0f;
+    }
+    TRACE("is_fsr: %s, sharpness: %2.4f\n", is_fsr ? "TRUE" : "FALSE", sharpness ? *sharpness : 0.0f);
+    return is_fsr;
 }
 
 HMONITOR fs_hack_monitor_from_rect(const RECT *in_rect)
