@@ -26,6 +26,12 @@
 #include <time.h>
 #include <stdlib.h>
 #include <unistd.h>
+#include <stdbool.h>
+#include <stdio.h>
+#include <assert.h>
+#include <errno.h>
+#include <poll.h>
+#include <sys/eventfd.h>
 
 #include "ntstatus.h"
 #define WIN32_NO_STATUS
@@ -33,6 +39,7 @@
 #include "winnt.h"
 #include "winioctl.h"
 #include "wine/server.h"
+#include "wine/list.h"
 
 #include "vulkan_private.h"
 #include "winreg.h"
@@ -237,6 +244,11 @@ static struct VkPhysicalDevice_T *wine_vk_physical_device_alloc(struct VkInstanc
     struct VkPhysicalDevice_T *object;
     uint32_t num_host_properties, num_properties = 0;
     VkExtensionProperties *host_properties = NULL;
+#if defined(USE_STRUCT_CONVERSION)
+    VkPhysicalDeviceProperties_host physdev_properties;
+#else
+    VkPhysicalDeviceProperties physdev_properties;
+#endif
     VkResult res;
     unsigned int i, j;
 
@@ -246,6 +258,9 @@ static struct VkPhysicalDevice_T *wine_vk_physical_device_alloc(struct VkInstanc
     object->base.loader_magic = VULKAN_ICD_MAGIC_VALUE;
     object->instance = instance;
     object->phys_dev = phys_dev;
+
+    instance->funcs.p_vkGetPhysicalDeviceProperties(phys_dev, &physdev_properties);
+    object->api_version = physdev_properties.apiVersion;
 
     WINE_VK_ADD_DISPATCHABLE_MAPPING(instance, object, phys_dev);
 
@@ -284,6 +299,14 @@ static struct VkPhysicalDevice_T *wine_vk_physical_device_alloc(struct VkInstanc
             snprintf(host_properties[i].extensionName, sizeof(host_properties[i].extensionName),
                     VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
             host_properties[i].specVersion = VK_KHR_EXTERNAL_MEMORY_WIN32_SPEC_VERSION;
+        }
+        if (!strcmp(host_properties[i].extensionName, "VK_KHR_external_semaphore_fd"))
+        {
+            TRACE("Substituting VK_KHR_external_semaphore_fd for VK_KHR_external_semaphore_win32\n");
+
+            snprintf(host_properties[i].extensionName, sizeof(host_properties[i].extensionName),
+                    VK_KHR_EXTERNAL_SEMAPHORE_WIN32_EXTENSION_NAME);
+            host_properties[i].specVersion = VK_KHR_EXTERNAL_SEMAPHORE_WIN32_SPEC_VERSION;
         }
 
         if (wine_vk_device_extension_supported(host_properties[i].extensionName))
@@ -357,6 +380,14 @@ static void wine_vk_device_get_queues(struct VkDevice_T *device,
         queue->family_index = family_index;
         queue->queue_index = i;
         queue->flags = flags;
+
+        pthread_mutex_init(&queue->submissions_mutex, NULL);
+        pthread_cond_init(&queue->submissions_cond, NULL);
+        list_init(&queue->submissions);
+
+        pthread_mutex_init(&queue->signaller_mutex, NULL);
+        pthread_cond_init(&queue->signaller_cond, NULL);
+        list_init(&queue->signal_ops);
 
         /* The Vulkan spec says:
          *
@@ -442,10 +473,10 @@ static char **parse_xr_extensions(unsigned int *len)
     return list;
 }
 
-static VkResult wine_vk_device_convert_create_info(const VkDeviceCreateInfo *src,
+static VkResult wine_vk_device_convert_create_info(VkPhysicalDevice phys_dev, const VkDeviceCreateInfo *src,
         VkDeviceCreateInfo *dst, BOOL *must_free_extensions)
 {
-    unsigned int i, append_xr = 0, replace_win32 = 0, wine_extension_count;
+    unsigned int i, append_xr = 0, replace_win32 = 0, timeline_enabled = 0, wine_extension_count;
     VkResult res;
 
     static const char *wine_xr_extension_name = "VK_WINE_openxr_device_extensions";
@@ -466,29 +497,23 @@ static VkResult wine_vk_device_convert_create_info(const VkDeviceCreateInfo *src
     {
         const char *extension_name = dst->ppEnabledExtensionNames[i];
         if (!strcmp(extension_name, wine_xr_extension_name))
-        {
             append_xr = 1;
-            break;
-        }
-    }
-    for (i = 0; i < src->enabledExtensionCount; i++)
-    {
-        if (!strcmp(src->ppEnabledExtensionNames[i], "VK_KHR_external_memory_win32"))
-        {
+        else if (!strcmp(extension_name, "VK_KHR_external_memory_win32") || !strcmp(extension_name, "VK_KHR_external_semaphore_win32"))
             replace_win32 = 1;
-            break;
-        }
+        else if (!strcmp(extension_name, "VK_KHR_timeline_semaphore"))
+            timeline_enabled = 1;
     }
+
     if (append_xr || replace_win32)
     {
-        unsigned int xr_extensions_len = 0, o = 0;
+        unsigned int xr_extensions_len = 0, o = 0, j;
         char **xr_extensions_list = NULL;
         char **new_extensions_list;
 
         if (append_xr)
             xr_extensions_list = parse_xr_extensions(&xr_extensions_len);
 
-        new_extensions_list = malloc(sizeof(char *) * (dst->enabledExtensionCount + xr_extensions_len));
+        new_extensions_list = malloc(sizeof(char *) * (dst->enabledExtensionCount + xr_extensions_len + replace_win32));
 
         if(append_xr && !xr_extensions_list)
             WARN("Requested to use XR extensions, but none are set!\n");
@@ -500,6 +525,24 @@ static VkResult wine_vk_device_convert_create_info(const VkDeviceCreateInfo *src
 
             if (replace_win32 && !strcmp(src->ppEnabledExtensionNames[i], "VK_KHR_external_memory_win32"))
                 new_extensions_list[o] = strdup("VK_KHR_external_memory_fd");
+            else if (replace_win32 && !strcmp(src->ppEnabledExtensionNames[i], "VK_KHR_external_semaphore_win32"))
+            {
+                new_extensions_list[o] = strdup("VK_KHR_external_semaphore_fd");
+
+                /* D3D12-Fence interoperable semaphores are implemented using timeline semaphores */
+                if (!timeline_enabled && (phys_dev->api_version < VK_API_VERSION_1_2 || phys_dev->instance->api_version < VK_API_VERSION_1_2))
+                {
+                    for (j = 0; j < phys_dev->extension_count; j++)
+                    {
+                        if (!strcmp(phys_dev->extensions[j].extensionName, "VK_KHR_timeline_semaphore"))
+                        {
+                            new_extensions_list[++o] = strdup("VK_KHR_timeline_semaphore");
+                            break;
+                        }
+                    }
+                }
+
+            }
             else
                 new_extensions_list[o] = strdup(dst->ppEnabledExtensionNames[i]);
             ++o;
@@ -557,6 +600,20 @@ static void wine_vk_device_free(struct VkDevice_T *device)
         for (i = 0; i < device->queue_count; i++)
         {
             queue = &device->queues[i];
+
+            queue->stop = true;
+            pthread_cond_signal(&queue->submissions_cond);
+            pthread_cond_signal(&queue->signaller_cond);
+
+            pthread_join(queue->virtual_queue_thread, NULL);
+            pthread_join(queue->signal_thread, NULL);
+
+            pthread_mutex_destroy(&queue->submissions_mutex);
+            pthread_mutex_destroy(&queue->signaller_mutex);
+
+            pthread_cond_destroy(&queue->submissions_cond);
+            pthread_cond_destroy(&queue->signaller_cond);
+
             if (queue && queue->queue)
                 WINE_VK_REMOVE_HANDLE_MAPPING(device->phys_dev->instance, queue);
         }
@@ -835,6 +892,8 @@ VkResult WINAPI __wine_create_vk_device_with_callback(VkPhysicalDevice phys_dev,
         VkResult (WINAPI *native_vkCreateDevice)(VkPhysicalDevice, const VkDeviceCreateInfo *, const VkAllocationCallbacks *,
         VkDevice *, void * (*)(VkInstance, const char *), void *), void *native_vkCreateDevice_context)
 {
+    VkPhysicalDeviceFeatures features = {0};
+    VkPhysicalDeviceFeatures2 *features2;
     VkDeviceCreateInfo create_info_host;
     struct VkQueue_T *next_queue;
     struct VkDevice_T *object;
@@ -864,9 +923,28 @@ VkResult WINAPI __wine_create_vk_device_with_callback(VkPhysicalDevice phys_dev,
     object->base.base.loader_magic = VULKAN_ICD_MAGIC_VALUE;
     object->phys_dev = phys_dev;
 
-    res = wine_vk_device_convert_create_info(create_info, &create_info_host, &create_info_free_extensions);
+    res = wine_vk_device_convert_create_info(phys_dev, create_info, &create_info_host, &create_info_free_extensions);
     if (res != VK_SUCCESS)
         goto fail;
+
+    /* Enable shaderStorageImageWriteWithoutFormat for fshack
+     * XXX check if available
+     */
+    if (create_info_host.pEnabledFeatures)
+    {
+        features = *create_info_host.pEnabledFeatures;
+        features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+        create_info_host.pEnabledFeatures = &features;
+    }
+    if ((features2 = wine_vk_find_struct(&create_info_host, PHYSICAL_DEVICE_FEATURES_2)))
+    {
+        features2->features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+    }
+    else if (!create_info_host.pEnabledFeatures)
+    {
+        features.shaderStorageImageWriteWithoutFormat = VK_TRUE;
+        create_info_host.pEnabledFeatures = &features;
+    }
 
     if (native_vkCreateDevice)
         res = native_vkCreateDevice(phys_dev->phys_dev,
@@ -877,7 +955,7 @@ VkResult WINAPI __wine_create_vk_device_with_callback(VkPhysicalDevice phys_dev,
                 &create_info_host, NULL /* allocator */, &object->device);
 
     wine_vk_device_free_create_info(&create_info_host);
-    if(create_info_free_extensions)
+    if (create_info_free_extensions)
         wine_vk_device_free_create_info_extensions(&create_info_host);
     WINE_VK_ADD_DISPATCHABLE_MAPPING(phys_dev->instance, object, object->device);
     if (res != VK_SUCCESS)
@@ -951,6 +1029,7 @@ VkResult WINAPI __wine_create_vk_instance_with_callback(const VkInstanceCreateIn
 {
     VkInstanceCreateInfo create_info_host;
     const VkApplicationInfo *app_info;
+    uint32_t new_mxcsr, old_mxcsr;
     struct VkInstance_T *object;
     VkResult res;
 
@@ -1008,7 +1087,12 @@ VkResult WINAPI __wine_create_vk_instance_with_callback(const VkInstanceCreateIn
      * the native physical devices and present those to the application.
      * Cleanup happens as part of wine_vkDestroyInstance.
      */
+    __asm__ volatile("stmxcsr %0" : "=m"(old_mxcsr));
+    new_mxcsr = 0x1f80;
+    __asm__ volatile("ldmxcsr %0" : : "m"(new_mxcsr));
     res = wine_vk_instance_load_physical_devices(object);
+    __asm__ volatile("ldmxcsr %0" : : "m"(old_mxcsr));
+    TRACE("old_mxcsr %#x.\n", old_mxcsr);
     if (res != VK_SUCCESS)
     {
         ERR("Failed to load physical devices, res=%d\n", res);
@@ -1023,6 +1107,8 @@ VkResult WINAPI __wine_create_vk_instance_with_callback(const VkInstanceCreateIn
         TRACE("Engine name %s, engine version %#x.\n", debugstr_a(app_info->pEngineName),
                 app_info->engineVersion);
         TRACE("API version %#x.\n", app_info->apiVersion);
+
+        object->api_version = app_info->apiVersion;
 
         if (app_info->pEngineName && !strcmp(app_info->pEngineName, "idTech"))
             object->quirks |= WINEVULKAN_QUIRK_GET_DEVICE_PROC_ADDR;
@@ -1747,6 +1833,112 @@ NTSTATUS wine_vkGetPhysicalDeviceCalibrateableTimeDomainsEXT(void *args)
     return res;
 }
 
+static inline void wine_vk_normalize_semaphore_handle_types_win(VkExternalSemaphoreHandleTypeFlags *types)
+{
+    *types &=
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT |
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_KMT_BIT |
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT;
+}
+
+static inline void wine_vk_normalize_semaphore_handle_types_host(VkExternalSemaphoreHandleTypeFlags *types)
+{
+    *types &=
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT |
+        VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_SYNC_FD_BIT;
+}
+
+static void wine_vk_get_physical_device_external_semaphore_properties(VkPhysicalDevice phys_dev,
+    void (*p_vkGetPhysicalDeviceExternalSemaphoreProperties)(VkPhysicalDevice, const VkPhysicalDeviceExternalSemaphoreInfo *, VkExternalSemaphoreProperties *),
+    const VkPhysicalDeviceExternalSemaphoreInfo *semaphore_info, VkExternalSemaphoreProperties *properties)
+{
+    VkPhysicalDeviceExternalSemaphoreInfo semaphore_info_dup = *semaphore_info, semaphore_info_host;
+    VkSemaphoreTypeCreateInfo semaphore_type_info, *p_semaphore_type_info;
+    unsigned int i;
+    VkResult res;
+
+    if ((res = convert_VkPhysicalDeviceExternalSemaphoreInfo_struct_chain(semaphore_info->pNext, &semaphore_info_dup)) < 0)
+    {
+        WARN("Failed to convert VkPhysicalDeviceExternalSemaphoreInfo pNext chain, res=%d.\n", res);
+
+        properties->exportFromImportedHandleTypes = 0;
+        properties->compatibleHandleTypes = 0;
+        properties->externalSemaphoreFeatures = 0;
+        return;
+    }
+
+    semaphore_info_host = semaphore_info_dup;
+
+    switch(semaphore_info->handleType)
+    {
+        case VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT:
+            semaphore_info_host.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+            break;
+        case VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT:
+        {
+            if (phys_dev->api_version < VK_API_VERSION_1_2 ||
+                phys_dev->instance->api_version < VK_API_VERSION_1_2)
+            {
+                for (i = 0; i < phys_dev->extension_count; i++)
+                {
+                    if (!strcmp(phys_dev->extensions[i].extensionName, "VK_KHR_timeline_semaphore"))
+                        break;
+                }
+                if (i == phys_dev->extension_count)
+                {
+                    free_VkPhysicalDeviceExternalSemaphoreInfo_struct_chain(&semaphore_info_dup);
+                    properties->exportFromImportedHandleTypes = 0;
+                    properties->compatibleHandleTypes = 0;
+                    properties->externalSemaphoreFeatures = 0;
+                    return;
+                }
+            }
+
+            if ((p_semaphore_type_info = wine_vk_find_struct(&semaphore_info_host, SEMAPHORE_TYPE_CREATE_INFO)))
+            {
+                p_semaphore_type_info->semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+                p_semaphore_type_info->initialValue = 0;
+            }
+            else
+            {
+                semaphore_type_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO;
+                semaphore_type_info.pNext = semaphore_info_host.pNext;
+                semaphore_type_info.semaphoreType = VK_SEMAPHORE_TYPE_TIMELINE;
+                semaphore_type_info.initialValue = 0;
+
+                semaphore_info_host.pNext = &semaphore_type_info;
+            }
+
+            semaphore_info_host.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+            break;
+        }
+        default:
+            semaphore_info_host.handleType = 0;
+    }
+
+    if (semaphore_info->handleType && !semaphore_info_host.handleType)
+    {
+        free_VkPhysicalDeviceExternalSemaphoreInfo_struct_chain(&semaphore_info_dup);
+
+        properties->exportFromImportedHandleTypes = 0;
+        properties->compatibleHandleTypes = 0;
+        properties->externalSemaphoreFeatures = 0;
+        return;
+    }
+
+    p_vkGetPhysicalDeviceExternalSemaphoreProperties(phys_dev->phys_dev, &semaphore_info_host, properties);
+
+    free_VkPhysicalDeviceExternalSemaphoreInfo_struct_chain(&semaphore_info_dup);
+
+    if (properties->exportFromImportedHandleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT)
+        properties->exportFromImportedHandleTypes = semaphore_info->handleType;
+    wine_vk_normalize_semaphore_handle_types_win(&properties->exportFromImportedHandleTypes);
+
+    if (properties->compatibleHandleTypes & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT)
+        properties->compatibleHandleTypes = semaphore_info->handleType;
+    wine_vk_normalize_semaphore_handle_types_win(&properties->compatibleHandleTypes);
+}
+
 NTSTATUS wine_vkGetPhysicalDeviceExternalSemaphoreProperties(void *args)
 {
     struct vkGetPhysicalDeviceExternalSemaphoreProperties_params *params = args;
@@ -1755,9 +1947,8 @@ NTSTATUS wine_vkGetPhysicalDeviceExternalSemaphoreProperties(void *args)
     VkExternalSemaphoreProperties *properties = params->pExternalSemaphoreProperties;
 
     TRACE("%p, %p, %p\n", phys_dev, semaphore_info, properties);
-    properties->exportFromImportedHandleTypes = 0;
-    properties->compatibleHandleTypes = 0;
-    properties->externalSemaphoreFeatures = 0;
+    wine_vk_get_physical_device_external_semaphore_properties(phys_dev, phys_dev->instance->funcs.p_vkGetPhysicalDeviceExternalSemaphoreProperties, semaphore_info, properties);
+
     return STATUS_SUCCESS;
 }
 
@@ -1769,9 +1960,8 @@ NTSTATUS wine_vkGetPhysicalDeviceExternalSemaphorePropertiesKHR(void *args)
     VkExternalSemaphoreProperties *properties = params->pExternalSemaphoreProperties;
 
     TRACE("%p, %p, %p\n", phys_dev, semaphore_info, properties);
-    properties->exportFromImportedHandleTypes = 0;
-    properties->compatibleHandleTypes = 0;
-    properties->externalSemaphoreFeatures = 0;
+    wine_vk_get_physical_device_external_semaphore_properties(phys_dev, phys_dev->instance->funcs.p_vkGetPhysicalDeviceExternalSemaphorePropertiesKHR, semaphore_info, properties);
+
     return STATUS_SUCCESS;
 }
 
@@ -1799,7 +1989,7 @@ void WINAPI wine_vkGetPrivateDataEXT(VkDevice device, VkObjectType object_type, 
 #version 450
 
 layout(binding = 0) uniform sampler2D texSampler;
-layout(binding = 1, rgba8) uniform writeonly image2D outImage;
+layout(binding = 1) uniform writeonly image2D outImage;
 layout(push_constant) uniform pushConstants {
     //both in real image coords
     vec2 offset;
@@ -1812,84 +2002,871 @@ void main()
 {
     vec2 texcoord = (vec2(gl_GlobalInvocationID.xy) - constants.offset) / constants.extents;
     vec4 c = texture(texSampler, texcoord);
-    imageStore(outImage, ivec2(gl_GlobalInvocationID.xy), c.bgra);
+    imageStore(outImage, ivec2(gl_GlobalInvocationID.xy), c);
 }
 */
 const uint32_t blit_comp_spv[] = {
-    0x07230203,0x00010000,0x00080006,0x00000037,0x00000000,0x00020011,0x00000001,0x0006000b,
-    0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,0x00000000,0x00000001,
-    0x0006000f,0x00000005,0x00000004,0x6e69616d,0x00000000,0x0000000d,0x00060010,0x00000004,
-    0x00000011,0x00000008,0x00000008,0x00000001,0x00030003,0x00000002,0x000001c2,0x00040005,
-    0x00000004,0x6e69616d,0x00000000,0x00050005,0x00000009,0x63786574,0x64726f6f,0x00000000,
-    0x00080005,0x0000000d,0x475f6c67,0x61626f6c,0x766e496c,0x7461636f,0x496e6f69,0x00000044,
-    0x00060005,0x00000012,0x68737570,0x736e6f43,0x746e6174,0x00000073,0x00050006,0x00000012,
-    0x00000000,0x7366666f,0x00007465,0x00050006,0x00000012,0x00000001,0x65747865,0x0073746e,
-    0x00050005,0x00000014,0x736e6f63,0x746e6174,0x00000073,0x00030005,0x00000021,0x00000063,
-    0x00050005,0x00000025,0x53786574,0x6c706d61,0x00007265,0x00050005,0x0000002c,0x4974756f,
-    0x6567616d,0x00000000,0x00040047,0x0000000d,0x0000000b,0x0000001c,0x00050048,0x00000012,
-    0x00000000,0x00000023,0x00000000,0x00050048,0x00000012,0x00000001,0x00000023,0x00000008,
-    0x00030047,0x00000012,0x00000002,0x00040047,0x00000025,0x00000022,0x00000000,0x00040047,
-    0x00000025,0x00000021,0x00000000,0x00040047,0x0000002c,0x00000022,0x00000000,0x00040047,
-    0x0000002c,0x00000021,0x00000001,0x00030047,0x0000002c,0x00000019,0x00040047,0x00000036,
-    0x0000000b,0x00000019,0x00020013,0x00000002,0x00030021,0x00000003,0x00000002,0x00030016,
-    0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,0x00000002,0x00040020,0x00000008,
-    0x00000007,0x00000007,0x00040015,0x0000000a,0x00000020,0x00000000,0x00040017,0x0000000b,
-    0x0000000a,0x00000003,0x00040020,0x0000000c,0x00000001,0x0000000b,0x0004003b,0x0000000c,
-    0x0000000d,0x00000001,0x00040017,0x0000000e,0x0000000a,0x00000002,0x0004001e,0x00000012,
-    0x00000007,0x00000007,0x00040020,0x00000013,0x00000009,0x00000012,0x0004003b,0x00000013,
-    0x00000014,0x00000009,0x00040015,0x00000015,0x00000020,0x00000001,0x0004002b,0x00000015,
-    0x00000016,0x00000000,0x00040020,0x00000017,0x00000009,0x00000007,0x0004002b,0x00000015,
-    0x0000001b,0x00000001,0x00040017,0x0000001f,0x00000006,0x00000004,0x00040020,0x00000020,
-    0x00000007,0x0000001f,0x00090019,0x00000022,0x00000006,0x00000001,0x00000000,0x00000000,
-    0x00000000,0x00000001,0x00000000,0x0003001b,0x00000023,0x00000022,0x00040020,0x00000024,
-    0x00000000,0x00000023,0x0004003b,0x00000024,0x00000025,0x00000000,0x0004002b,0x00000006,
-    0x00000028,0x00000000,0x00090019,0x0000002a,0x00000006,0x00000001,0x00000000,0x00000000,
-    0x00000000,0x00000002,0x00000004,0x00040020,0x0000002b,0x00000000,0x0000002a,0x0004003b,
-    0x0000002b,0x0000002c,0x00000000,0x00040017,0x00000030,0x00000015,0x00000002,0x0004002b,
-    0x0000000a,0x00000034,0x00000008,0x0004002b,0x0000000a,0x00000035,0x00000001,0x0006002c,
-    0x0000000b,0x00000036,0x00000034,0x00000034,0x00000035,0x00050036,0x00000002,0x00000004,
-    0x00000000,0x00000003,0x000200f8,0x00000005,0x0004003b,0x00000008,0x00000009,0x00000007,
-    0x0004003b,0x00000020,0x00000021,0x00000007,0x0004003d,0x0000000b,0x0000000f,0x0000000d,
-    0x0007004f,0x0000000e,0x00000010,0x0000000f,0x0000000f,0x00000000,0x00000001,0x00040070,
-    0x00000007,0x00000011,0x00000010,0x00050041,0x00000017,0x00000018,0x00000014,0x00000016,
-    0x0004003d,0x00000007,0x00000019,0x00000018,0x00050083,0x00000007,0x0000001a,0x00000011,
-    0x00000019,0x00050041,0x00000017,0x0000001c,0x00000014,0x0000001b,0x0004003d,0x00000007,
-    0x0000001d,0x0000001c,0x00050088,0x00000007,0x0000001e,0x0000001a,0x0000001d,0x0003003e,
-    0x00000009,0x0000001e,0x0004003d,0x00000023,0x00000026,0x00000025,0x0004003d,0x00000007,
-    0x00000027,0x00000009,0x00070058,0x0000001f,0x00000029,0x00000026,0x00000027,0x00000002,
-    0x00000028,0x0003003e,0x00000021,0x00000029,0x0004003d,0x0000002a,0x0000002d,0x0000002c,
-    0x0004003d,0x0000000b,0x0000002e,0x0000000d,0x0007004f,0x0000000e,0x0000002f,0x0000002e,
-    0x0000002e,0x00000000,0x00000001,0x0004007c,0x00000030,0x00000031,0x0000002f,0x0004003d,
-    0x0000001f,0x00000032,0x00000021,0x0009004f,0x0000001f,0x00000033,0x00000032,0x00000032,
-    0x00000002,0x00000001,0x00000000,0x00000003,0x00040063,0x0000002d,0x00000031,0x00000033,
-    0x000100fd,0x00010038
+    0x07230203,0x00010000,0x0008000a,0x00000036,0x00000000,0x00020011,0x00000001,0x00020011,
+    0x00000038,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,
+    0x00000000,0x00000001,0x0006000f,0x00000005,0x00000004,0x6e69616d,0x00000000,0x0000000d,
+    0x00060010,0x00000004,0x00000011,0x00000008,0x00000008,0x00000001,0x00030003,0x00000002,
+    0x000001c2,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00050005,0x00000009,0x63786574,
+    0x64726f6f,0x00000000,0x00080005,0x0000000d,0x475f6c67,0x61626f6c,0x766e496c,0x7461636f,
+    0x496e6f69,0x00000044,0x00060005,0x00000012,0x68737570,0x736e6f43,0x746e6174,0x00000073,
+    0x00050006,0x00000012,0x00000000,0x7366666f,0x00007465,0x00050006,0x00000012,0x00000001,
+    0x65747865,0x0073746e,0x00050005,0x00000014,0x736e6f63,0x746e6174,0x00000073,0x00030005,
+    0x00000021,0x00000063,0x00050005,0x00000025,0x53786574,0x6c706d61,0x00007265,0x00050005,
+    0x0000002c,0x4974756f,0x6567616d,0x00000000,0x00040047,0x0000000d,0x0000000b,0x0000001c,
+    0x00050048,0x00000012,0x00000000,0x00000023,0x00000000,0x00050048,0x00000012,0x00000001,
+    0x00000023,0x00000008,0x00030047,0x00000012,0x00000002,0x00040047,0x00000025,0x00000022,
+    0x00000000,0x00040047,0x00000025,0x00000021,0x00000000,0x00040047,0x0000002c,0x00000022,
+    0x00000000,0x00040047,0x0000002c,0x00000021,0x00000001,0x00030047,0x0000002c,0x00000019,
+    0x00040047,0x00000035,0x0000000b,0x00000019,0x00020013,0x00000002,0x00030021,0x00000003,
+    0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,0x00000007,0x00000006,0x00000002,
+    0x00040020,0x00000008,0x00000007,0x00000007,0x00040015,0x0000000a,0x00000020,0x00000000,
+    0x00040017,0x0000000b,0x0000000a,0x00000003,0x00040020,0x0000000c,0x00000001,0x0000000b,
+    0x0004003b,0x0000000c,0x0000000d,0x00000001,0x00040017,0x0000000e,0x0000000a,0x00000002,
+    0x0004001e,0x00000012,0x00000007,0x00000007,0x00040020,0x00000013,0x00000009,0x00000012,
+    0x0004003b,0x00000013,0x00000014,0x00000009,0x00040015,0x00000015,0x00000020,0x00000001,
+    0x0004002b,0x00000015,0x00000016,0x00000000,0x00040020,0x00000017,0x00000009,0x00000007,
+    0x0004002b,0x00000015,0x0000001b,0x00000001,0x00040017,0x0000001f,0x00000006,0x00000004,
+    0x00040020,0x00000020,0x00000007,0x0000001f,0x00090019,0x00000022,0x00000006,0x00000001,
+    0x00000000,0x00000000,0x00000000,0x00000001,0x00000000,0x0003001b,0x00000023,0x00000022,
+    0x00040020,0x00000024,0x00000000,0x00000023,0x0004003b,0x00000024,0x00000025,0x00000000,
+    0x0004002b,0x00000006,0x00000028,0x00000000,0x00090019,0x0000002a,0x00000006,0x00000001,
+    0x00000000,0x00000000,0x00000000,0x00000002,0x00000000,0x00040020,0x0000002b,0x00000000,
+    0x0000002a,0x0004003b,0x0000002b,0x0000002c,0x00000000,0x00040017,0x00000030,0x00000015,
+    0x00000002,0x0004002b,0x0000000a,0x00000033,0x00000008,0x0004002b,0x0000000a,0x00000034,
+    0x00000001,0x0006002c,0x0000000b,0x00000035,0x00000033,0x00000033,0x00000034,0x00050036,
+    0x00000002,0x00000004,0x00000000,0x00000003,0x000200f8,0x00000005,0x0004003b,0x00000008,
+    0x00000009,0x00000007,0x0004003b,0x00000020,0x00000021,0x00000007,0x0004003d,0x0000000b,
+    0x0000000f,0x0000000d,0x0007004f,0x0000000e,0x00000010,0x0000000f,0x0000000f,0x00000000,
+    0x00000001,0x00040070,0x00000007,0x00000011,0x00000010,0x00050041,0x00000017,0x00000018,
+    0x00000014,0x00000016,0x0004003d,0x00000007,0x00000019,0x00000018,0x00050083,0x00000007,
+    0x0000001a,0x00000011,0x00000019,0x00050041,0x00000017,0x0000001c,0x00000014,0x0000001b,
+    0x0004003d,0x00000007,0x0000001d,0x0000001c,0x00050088,0x00000007,0x0000001e,0x0000001a,
+    0x0000001d,0x0003003e,0x00000009,0x0000001e,0x0004003d,0x00000023,0x00000026,0x00000025,
+    0x0004003d,0x00000007,0x00000027,0x00000009,0x00070058,0x0000001f,0x00000029,0x00000026,
+    0x00000027,0x00000002,0x00000028,0x0003003e,0x00000021,0x00000029,0x0004003d,0x0000002a,
+    0x0000002d,0x0000002c,0x0004003d,0x0000000b,0x0000002e,0x0000000d,0x0007004f,0x0000000e,
+    0x0000002f,0x0000002e,0x0000002e,0x00000000,0x00000001,0x0004007c,0x00000030,0x00000031,
+    0x0000002f,0x0004003d,0x0000001f,0x00000032,0x00000021,0x00040063,0x0000002d,0x00000031,
+    0x00000032,0x000100fd,0x00010038
 };
 
-static VkResult create_pipeline(VkDevice device, struct VkSwapchainKHR_T *swapchain, VkShaderModule shaderModule)
+/*
+#version 460
+#extension GL_GOOGLE_include_directive: require
+
+layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
+
+layout(binding = 0) uniform sampler2D texSampler;
+layout(binding = 1) uniform writeonly image2D outImage;
+
+#define A_GPU 1
+#define A_GLSL 1
+//#include "ffx_a.h"
+#define FSR_EASU_F 1
+AF4 FsrEasuRF(AF2 p){return AF4(textureGather(texSampler, p, 0));}
+AF4 FsrEasuGF(AF2 p){return AF4(textureGather(texSampler, p, 1));}
+AF4 FsrEasuBF(AF2 p){return AF4(textureGather(texSampler, p, 2));}
+//#include "ffx_fsr1.h"
+
+layout(push_constant) uniform pushConstants {
+    uvec4 c1, c2, c3, c4;
+};
+
+
+void main()
 {
-    VkResult res;
+    vec3 color;
+
+    if (any(greaterThanEqual(gl_GlobalInvocationID.xy, c4.zw)))
+        return;
+
+    FsrEasuF(color, uvec2(gl_GlobalInvocationID.xy), c1, c2, c3, c4);
+
+    imageStore(outImage, ivec2(gl_GlobalInvocationID.xy), vec4(color, 1.0));
+}
+*/
+const uint32_t fsr_easu_comp_spv[] = {
+    0x07230203,0x00010000,0x0008000a,0x0000129e,0x00000000,0x00020011,0x00000001,0x00020011,
+    0x00000038,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,
+    0x00000000,0x00000001,0x0006000f,0x00000005,0x00000004,0x6e69616d,0x00000000,0x000004ee,
+    0x00060010,0x00000004,0x00000011,0x00000008,0x00000008,0x00000001,0x00030003,0x00000002,
+    0x000001cc,0x000a0004,0x475f4c47,0x4c474f4f,0x70635f45,0x74735f70,0x5f656c79,0x656e696c,
+    0x7269645f,0x69746365,0x00006576,0x00080004,0x475f4c47,0x4c474f4f,0x6e695f45,0x64756c63,
+    0x69645f65,0x74636572,0x00657669,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00050005,
+    0x000000bc,0x53786574,0x6c706d61,0x00007265,0x00080005,0x000004ee,0x475f6c67,0x61626f6c,
+    0x766e496c,0x7461636f,0x496e6f69,0x00000044,0x00060005,0x000004f1,0x68737570,0x736e6f43,
+    0x746e6174,0x00000073,0x00040006,0x000004f1,0x00000000,0x00003163,0x00040006,0x000004f1,
+    0x00000001,0x00003263,0x00040006,0x000004f1,0x00000002,0x00003363,0x00040006,0x000004f1,
+    0x00000003,0x00003463,0x00030005,0x000004f3,0x00000000,0x00050005,0x00000517,0x4974756f,
+    0x6567616d,0x00000000,0x00040047,0x000000bc,0x00000022,0x00000000,0x00040047,0x000000bc,
+    0x00000021,0x00000000,0x00040047,0x000004ee,0x0000000b,0x0000001c,0x00050048,0x000004f1,
+    0x00000000,0x00000023,0x00000000,0x00050048,0x000004f1,0x00000001,0x00000023,0x00000010,
+    0x00050048,0x000004f1,0x00000002,0x00000023,0x00000020,0x00050048,0x000004f1,0x00000003,
+    0x00000023,0x00000030,0x00030047,0x000004f1,0x00000002,0x00040047,0x00000517,0x00000022,
+    0x00000000,0x00040047,0x00000517,0x00000021,0x00000001,0x00030047,0x00000517,0x00000019,
+    0x00040047,0x00000523,0x0000000b,0x00000019,0x00020013,0x00000002,0x00030021,0x00000003,
+    0x00000002,0x00030016,0x00000006,0x00000020,0x00040017,0x0000000c,0x00000006,0x00000002,
+    0x00040017,0x00000011,0x00000006,0x00000003,0x00040017,0x00000016,0x00000006,0x00000004,
+    0x00040015,0x0000001b,0x00000020,0x00000000,0x00020014,0x0000004f,0x00040017,0x00000060,
+    0x0000001b,0x00000002,0x00040017,0x00000062,0x0000001b,0x00000004,0x0004002b,0x00000006,
+    0x00000093,0x3f800000,0x0004002b,0x00000006,0x0000009b,0x00000000,0x0004002b,0x0000001b,
+    0x000000a3,0x7ef07ebb,0x0004002b,0x0000001b,0x000000ac,0x5f347d74,0x0004002b,0x0000001b,
+    0x000000b1,0x00000001,0x00090019,0x000000b9,0x00000006,0x00000001,0x00000000,0x00000000,
+    0x00000000,0x00000001,0x00000000,0x0003001b,0x000000ba,0x000000b9,0x00040020,0x000000bb,
+    0x00000000,0x000000ba,0x0004003b,0x000000bb,0x000000bc,0x00000000,0x00040015,0x000000bf,
+    0x00000020,0x00000001,0x0004002b,0x000000bf,0x000000c0,0x00000000,0x0004002b,0x000000bf,
+    0x000000cb,0x00000001,0x0004002b,0x000000bf,0x000000d6,0x00000002,0x0004002b,0x0000001b,
+    0x000000e0,0x00000000,0x0004002b,0x00000006,0x0000010d,0x3ecccccd,0x0004002b,0x00000006,
+    0x00000112,0xbf800000,0x0004002b,0x00000006,0x00000123,0x3fc80000,0x0004002b,0x00000006,
+    0x00000128,0xbf100000,0x0004002b,0x00000006,0x00000230,0x3f000000,0x0004002b,0x00000006,
+    0x000002f5,0x38000000,0x0004002b,0x00000006,0x0000033e,0xbf000000,0x0004002b,0x00000006,
+    0x00000348,0xbe947ae1,0x0005002c,0x0000000c,0x0000039c,0x0000009b,0x00000112,0x0005002c,
+    0x0000000c,0x000003b7,0x00000093,0x00000112,0x0005002c,0x0000000c,0x000003d2,0x00000112,
+    0x00000093,0x0005002c,0x0000000c,0x000003ed,0x0000009b,0x00000093,0x0005002c,0x0000000c,
+    0x00000423,0x00000112,0x0000009b,0x0005002c,0x0000000c,0x0000043e,0x00000093,0x00000093,
+    0x0004002b,0x00000006,0x00000459,0x40000000,0x0005002c,0x0000000c,0x0000045a,0x00000459,
+    0x00000093,0x0005002c,0x0000000c,0x00000475,0x00000459,0x0000009b,0x0005002c,0x0000000c,
+    0x00000490,0x00000093,0x0000009b,0x0005002c,0x0000000c,0x000004ab,0x00000093,0x00000459,
+    0x0005002c,0x0000000c,0x000004c6,0x0000009b,0x00000459,0x00040017,0x000004ec,0x0000001b,
+    0x00000003,0x00040020,0x000004ed,0x00000001,0x000004ec,0x0004003b,0x000004ed,0x000004ee,
+    0x00000001,0x0006001e,0x000004f1,0x00000062,0x00000062,0x00000062,0x00000062,0x00040020,
+    0x000004f2,0x00000009,0x000004f1,0x0004003b,0x000004f2,0x000004f3,0x00000009,0x0004002b,
+    0x000000bf,0x000004f4,0x00000003,0x00040020,0x000004f5,0x00000009,0x00000062,0x00040017,
+    0x000004f9,0x0000004f,0x00000002,0x00090019,0x00000515,0x00000006,0x00000001,0x00000000,
+    0x00000000,0x00000000,0x00000002,0x00000000,0x00040020,0x00000516,0x00000000,0x00000515,
+    0x0004003b,0x00000516,0x00000517,0x00000000,0x00040017,0x0000051b,0x000000bf,0x00000002,
+    0x0004002b,0x0000001b,0x00000522,0x00000008,0x0006002c,0x000004ec,0x00000523,0x00000522,
+    0x00000522,0x000000b1,0x0007002c,0x00000016,0x0000127a,0x00000230,0x00000230,0x00000230,
+    0x00000230,0x00030001,0x0000000c,0x0000129d,0x00050036,0x00000002,0x00000004,0x00000000,
+    0x00000003,0x000200f8,0x00000005,0x000300f7,0x00000524,0x00000000,0x000300fb,0x000000e0,
+    0x00000525,0x000200f8,0x00000525,0x0004003d,0x000004ec,0x000004ef,0x000004ee,0x0007004f,
+    0x00000060,0x000004f0,0x000004ef,0x000004ef,0x00000000,0x00000001,0x00050041,0x000004f5,
+    0x000004f6,0x000004f3,0x000004f4,0x0004003d,0x00000062,0x000004f7,0x000004f6,0x0007004f,
+    0x00000060,0x000004f8,0x000004f7,0x000004f7,0x00000002,0x00000003,0x000500ae,0x000004f9,
+    0x000004fa,0x000004f0,0x000004f8,0x0004009a,0x0000004f,0x000004fb,0x000004fa,0x000300f7,
+    0x000004fd,0x00000000,0x000400fa,0x000004fb,0x000004fc,0x000004fd,0x000200f8,0x000004fc,
+    0x000200f9,0x00000524,0x000200f8,0x000004fd,0x00050051,0x0000001b,0x00000502,0x000004ef,
+    0x00000000,0x00050051,0x0000001b,0x00000503,0x000004ef,0x00000001,0x00050050,0x00000060,
+    0x00000504,0x00000502,0x00000503,0x00050041,0x000004f5,0x00000508,0x000004f3,0x000000c0,
+    0x0004003d,0x00000062,0x00000509,0x00000508,0x00050041,0x000004f5,0x0000050b,0x000004f3,
+    0x000000cb,0x0004003d,0x00000062,0x0000050c,0x0000050b,0x00050041,0x000004f5,0x0000050e,
+    0x000004f3,0x000000d6,0x0004003d,0x00000062,0x0000050f,0x0000050e,0x00040070,0x0000000c,
+    0x00000618,0x00000504,0x00050051,0x0000001b,0x0000061b,0x00000509,0x00000000,0x00050051,
+    0x0000001b,0x0000061c,0x00000509,0x00000001,0x00050050,0x00000060,0x0000061d,0x0000061b,
+    0x0000061c,0x0004007c,0x0000000c,0x0000061e,0x0000061d,0x00050085,0x0000000c,0x0000061f,
+    0x00000618,0x0000061e,0x00050051,0x0000001b,0x00000622,0x00000509,0x00000002,0x00050051,
+    0x0000001b,0x00000623,0x00000509,0x00000003,0x00050050,0x00000060,0x00000624,0x00000622,
+    0x00000623,0x0004007c,0x0000000c,0x00000625,0x00000624,0x00050081,0x0000000c,0x00000626,
+    0x0000061f,0x00000625,0x0006000c,0x0000000c,0x00000628,0x00000001,0x00000008,0x00000626,
+    0x00050083,0x0000000c,0x0000062b,0x00000626,0x00000628,0x00050051,0x0000001b,0x0000062f,
+    0x0000050c,0x00000000,0x00050051,0x0000001b,0x00000630,0x0000050c,0x00000001,0x00050050,
+    0x00000060,0x00000631,0x0000062f,0x00000630,0x0004007c,0x0000000c,0x00000632,0x00000631,
+    0x00050085,0x0000000c,0x00000633,0x00000628,0x00000632,0x00050051,0x0000001b,0x00000636,
+    0x0000050c,0x00000002,0x00050051,0x0000001b,0x00000637,0x0000050c,0x00000003,0x00050050,
+    0x00000060,0x00000638,0x00000636,0x00000637,0x0004007c,0x0000000c,0x00000639,0x00000638,
+    0x00050081,0x0000000c,0x0000063a,0x00000633,0x00000639,0x00050051,0x0000001b,0x0000063e,
+    0x0000050f,0x00000000,0x00050051,0x0000001b,0x0000063f,0x0000050f,0x00000001,0x00050050,
+    0x00000060,0x00000640,0x0000063e,0x0000063f,0x0004007c,0x0000000c,0x00000641,0x00000640,
+    0x00050081,0x0000000c,0x00000642,0x0000063a,0x00000641,0x00050051,0x0000001b,0x00000646,
+    0x0000050f,0x00000002,0x00050051,0x0000001b,0x00000647,0x0000050f,0x00000003,0x00050050,
+    0x00000060,0x00000648,0x00000646,0x00000647,0x0004007c,0x0000000c,0x00000649,0x00000648,
+    0x00050081,0x0000000c,0x0000064a,0x0000063a,0x00000649,0x00050051,0x0000001b,0x0000064e,
+    0x000004f7,0x00000000,0x00050051,0x0000001b,0x0000064f,0x000004f7,0x00000001,0x00050050,
+    0x00000060,0x00000650,0x0000064e,0x0000064f,0x0004007c,0x0000000c,0x00000651,0x00000650,
+    0x00050081,0x0000000c,0x00000652,0x0000063a,0x00000651,0x0004003d,0x000000ba,0x00000845,
+    0x000000bc,0x00060060,0x00000016,0x00000847,0x00000845,0x0000063a,0x000000c0,0x00060060,
+    0x00000016,0x00000851,0x00000845,0x0000063a,0x000000cb,0x00060060,0x00000016,0x0000085b,
+    0x00000845,0x0000063a,0x000000d6,0x00060060,0x00000016,0x00000865,0x00000845,0x00000642,
+    0x000000c0,0x00060060,0x00000016,0x0000086f,0x00000845,0x00000642,0x000000cb,0x00060060,
+    0x00000016,0x00000879,0x00000845,0x00000642,0x000000d6,0x00060060,0x00000016,0x00000883,
+    0x00000845,0x0000064a,0x000000c0,0x00060060,0x00000016,0x0000088d,0x00000845,0x0000064a,
+    0x000000cb,0x00060060,0x00000016,0x00000897,0x00000845,0x0000064a,0x000000d6,0x00060060,
+    0x00000016,0x000008a1,0x00000845,0x00000652,0x000000c0,0x00060060,0x00000016,0x000008ab,
+    0x00000845,0x00000652,0x000000cb,0x00060060,0x00000016,0x000008b5,0x00000845,0x00000652,
+    0x000000d6,0x00050085,0x00000016,0x0000066d,0x0000085b,0x0000127a,0x00050085,0x00000016,
+    0x00000670,0x00000847,0x0000127a,0x00050081,0x00000016,0x00000672,0x00000670,0x00000851,
+    0x00050081,0x00000016,0x00000673,0x0000066d,0x00000672,0x00050085,0x00000016,0x00000676,
+    0x00000879,0x0000127a,0x00050085,0x00000016,0x00000679,0x00000865,0x0000127a,0x00050081,
+    0x00000016,0x0000067b,0x00000679,0x0000086f,0x00050081,0x00000016,0x0000067c,0x00000676,
+    0x0000067b,0x00050085,0x00000016,0x0000067f,0x00000897,0x0000127a,0x00050085,0x00000016,
+    0x00000682,0x00000883,0x0000127a,0x00050081,0x00000016,0x00000684,0x00000682,0x0000088d,
+    0x00050081,0x00000016,0x00000685,0x0000067f,0x00000684,0x00050085,0x00000016,0x00000688,
+    0x000008b5,0x0000127a,0x00050085,0x00000016,0x0000068b,0x000008a1,0x0000127a,0x00050081,
+    0x00000016,0x0000068d,0x0000068b,0x000008ab,0x00050081,0x00000016,0x0000068e,0x00000688,
+    0x0000068d,0x00050051,0x00000006,0x00000690,0x00000673,0x00000000,0x00050051,0x00000006,
+    0x00000692,0x00000673,0x00000001,0x00050051,0x00000006,0x00000694,0x0000067c,0x00000000,
+    0x00050051,0x00000006,0x00000696,0x0000067c,0x00000001,0x00050051,0x00000006,0x00000698,
+    0x0000067c,0x00000002,0x00050051,0x00000006,0x0000069a,0x0000067c,0x00000003,0x00050051,
+    0x00000006,0x0000069c,0x00000685,0x00000000,0x00050051,0x00000006,0x0000069e,0x00000685,
+    0x00000001,0x00050051,0x00000006,0x000006a0,0x00000685,0x00000002,0x00050051,0x00000006,
+    0x000006a2,0x00000685,0x00000003,0x00050051,0x00000006,0x000006a4,0x0000068e,0x00000002,
+    0x00050051,0x00000006,0x000006a6,0x0000068e,0x00000003,0x00050051,0x00000006,0x00000913,
+    0x0000062b,0x00000000,0x00050083,0x00000006,0x00000914,0x00000093,0x00000913,0x00050051,
+    0x00000006,0x00000917,0x0000062b,0x00000001,0x00050083,0x00000006,0x00000918,0x00000093,
+    0x00000917,0x00050085,0x00000006,0x00000919,0x00000914,0x00000918,0x00050083,0x00000006,
+    0x00000939,0x000006a2,0x00000698,0x00050083,0x00000006,0x0000093c,0x00000698,0x0000069a,
+    0x0006000c,0x00000006,0x0000093e,0x00000001,0x00000004,0x00000939,0x0006000c,0x00000006,
+    0x00000940,0x00000001,0x00000004,0x0000093c,0x0007000c,0x00000006,0x00000941,0x00000001,
+    0x00000028,0x0000093e,0x00000940,0x0004007c,0x0000001b,0x00000993,0x00000941,0x00050082,
+    0x0000001b,0x00000994,0x000000a3,0x00000993,0x0004007c,0x00000006,0x00000995,0x00000994,
+    0x00050083,0x00000006,0x00000946,0x000006a2,0x0000069a,0x00050085,0x00000006,0x00000949,
+    0x00000946,0x00000919,0x0006000c,0x00000006,0x0000094f,0x00000001,0x00000004,0x00000946,
+    0x00050085,0x00000006,0x00000951,0x0000094f,0x00000995,0x0008000c,0x00000006,0x000009a0,
+    0x00000001,0x0000002b,0x00000951,0x0000009b,0x00000093,0x00050085,0x00000006,0x00000955,
+    0x000009a0,0x000009a0,0x00050085,0x00000006,0x00000958,0x00000955,0x00000919,0x00050083,
+    0x00000006,0x0000095d,0x00000696,0x00000698,0x00050083,0x00000006,0x00000960,0x00000698,
+    0x00000690,0x0006000c,0x00000006,0x00000962,0x00000001,0x00000004,0x0000095d,0x0006000c,
+    0x00000006,0x00000964,0x00000001,0x00000004,0x00000960,0x0007000c,0x00000006,0x00000965,
+    0x00000001,0x00000028,0x00000962,0x00000964,0x0004007c,0x0000001b,0x000009ac,0x00000965,
+    0x00050082,0x0000001b,0x000009ad,0x000000a3,0x000009ac,0x0004007c,0x00000006,0x000009ae,
+    0x000009ad,0x00050083,0x00000006,0x0000096a,0x00000696,0x00000690,0x00050085,0x00000006,
+    0x0000096d,0x0000096a,0x00000919,0x0006000c,0x00000006,0x00000973,0x00000001,0x00000004,
+    0x0000096a,0x00050085,0x00000006,0x00000975,0x00000973,0x000009ae,0x0008000c,0x00000006,
+    0x000009b9,0x00000001,0x0000002b,0x00000975,0x0000009b,0x00000093,0x00050085,0x00000006,
+    0x00000979,0x000009b9,0x000009b9,0x00050085,0x00000006,0x0000097c,0x00000979,0x00000919,
+    0x00050081,0x00000006,0x0000097e,0x00000958,0x0000097c,0x00050085,0x00000006,0x000009e8,
+    0x00000913,0x00000918,0x00050083,0x00000006,0x000009fe,0x000006a0,0x000006a2,0x0006000c,
+    0x00000006,0x00000a03,0x00000001,0x00000004,0x000009fe,0x0007000c,0x00000006,0x00000a06,
+    0x00000001,0x00000028,0x00000a03,0x0000093e,0x0004007c,0x0000001b,0x00000a58,0x00000a06,
+    0x00050082,0x0000001b,0x00000a59,0x000000a3,0x00000a58,0x0004007c,0x00000006,0x00000a5a,
+    0x00000a59,0x00050083,0x00000006,0x00000a0b,0x000006a0,0x00000698,0x00050085,0x00000006,
+    0x00000a0e,0x00000a0b,0x000009e8,0x00050081,0x00000006,0x00000a11,0x00000949,0x00000a0e,
+    0x0006000c,0x00000006,0x00000a14,0x00000001,0x00000004,0x00000a0b,0x00050085,0x00000006,
+    0x00000a16,0x00000a14,0x00000a5a,0x0008000c,0x00000006,0x00000a65,0x00000001,0x0000002b,
+    0x00000a16,0x0000009b,0x00000093,0x00050085,0x00000006,0x00000a1a,0x00000a65,0x00000a65,
+    0x00050085,0x00000006,0x00000a1d,0x00000a1a,0x000009e8,0x00050081,0x00000006,0x00000a1f,
+    0x0000097e,0x00000a1d,0x00050083,0x00000006,0x00000a22,0x0000069c,0x000006a2,0x00050083,
+    0x00000006,0x00000a25,0x000006a2,0x00000692,0x0006000c,0x00000006,0x00000a27,0x00000001,
+    0x00000004,0x00000a22,0x0006000c,0x00000006,0x00000a29,0x00000001,0x00000004,0x00000a25,
+    0x0007000c,0x00000006,0x00000a2a,0x00000001,0x00000028,0x00000a27,0x00000a29,0x0004007c,
+    0x0000001b,0x00000a71,0x00000a2a,0x00050082,0x0000001b,0x00000a72,0x000000a3,0x00000a71,
+    0x0004007c,0x00000006,0x00000a73,0x00000a72,0x00050083,0x00000006,0x00000a2f,0x0000069c,
+    0x00000692,0x00050085,0x00000006,0x00000a32,0x00000a2f,0x000009e8,0x00050081,0x00000006,
+    0x00000a35,0x0000096d,0x00000a32,0x0006000c,0x00000006,0x00000a38,0x00000001,0x00000004,
+    0x00000a2f,0x00050085,0x00000006,0x00000a3a,0x00000a38,0x00000a73,0x0008000c,0x00000006,
+    0x00000a7e,0x00000001,0x0000002b,0x00000a3a,0x0000009b,0x00000093,0x00050085,0x00000006,
+    0x00000a3e,0x00000a7e,0x00000a7e,0x00050085,0x00000006,0x00000a41,0x00000a3e,0x000009e8,
+    0x00050081,0x00000006,0x00000a43,0x00000a1f,0x00000a41,0x00050085,0x00000006,0x00000ab7,
+    0x00000914,0x00000917,0x00050083,0x00000006,0x00000ac3,0x0000069c,0x00000696,0x00050083,
+    0x00000006,0x00000ac6,0x00000696,0x00000694,0x0006000c,0x00000006,0x00000ac8,0x00000001,
+    0x00000004,0x00000ac3,0x0006000c,0x00000006,0x00000aca,0x00000001,0x00000004,0x00000ac6,
+    0x0007000c,0x00000006,0x00000acb,0x00000001,0x00000028,0x00000ac8,0x00000aca,0x0004007c,
+    0x0000001b,0x00000b1d,0x00000acb,0x00050082,0x0000001b,0x00000b1e,0x000000a3,0x00000b1d,
+    0x0004007c,0x00000006,0x00000b1f,0x00000b1e,0x00050083,0x00000006,0x00000ad0,0x0000069c,
+    0x00000694,0x00050085,0x00000006,0x00000ad3,0x00000ad0,0x00000ab7,0x00050081,0x00000006,
+    0x00000ad6,0x00000a11,0x00000ad3,0x0006000c,0x00000006,0x00000ad9,0x00000001,0x00000004,
+    0x00000ad0,0x00050085,0x00000006,0x00000adb,0x00000ad9,0x00000b1f,0x0008000c,0x00000006,
+    0x00000b2a,0x00000001,0x0000002b,0x00000adb,0x0000009b,0x00000093,0x00050085,0x00000006,
+    0x00000adf,0x00000b2a,0x00000b2a,0x00050085,0x00000006,0x00000ae2,0x00000adf,0x00000ab7,
+    0x00050081,0x00000006,0x00000ae4,0x00000a43,0x00000ae2,0x00050083,0x00000006,0x00000ae7,
+    0x000006a6,0x00000696,0x0006000c,0x00000006,0x00000aec,0x00000001,0x00000004,0x00000ae7,
+    0x0007000c,0x00000006,0x00000aef,0x00000001,0x00000028,0x00000aec,0x00000962,0x0004007c,
+    0x0000001b,0x00000b36,0x00000aef,0x00050082,0x0000001b,0x00000b37,0x000000a3,0x00000b36,
+    0x0004007c,0x00000006,0x00000b38,0x00000b37,0x00050083,0x00000006,0x00000af4,0x000006a6,
+    0x00000698,0x00050085,0x00000006,0x00000af7,0x00000af4,0x00000ab7,0x00050081,0x00000006,
+    0x00000afa,0x00000a35,0x00000af7,0x0006000c,0x00000006,0x00000afd,0x00000001,0x00000004,
+    0x00000af4,0x00050085,0x00000006,0x00000aff,0x00000afd,0x00000b38,0x0008000c,0x00000006,
+    0x00000b43,0x00000001,0x0000002b,0x00000aff,0x0000009b,0x00000093,0x00050085,0x00000006,
+    0x00000b03,0x00000b43,0x00000b43,0x00050085,0x00000006,0x00000b06,0x00000b03,0x00000ab7,
+    0x00050081,0x00000006,0x00000b08,0x00000ae4,0x00000b06,0x00050085,0x00000006,0x00000b84,
+    0x00000913,0x00000917,0x00050083,0x00000006,0x00000b88,0x0000069e,0x0000069c,0x0006000c,
+    0x00000006,0x00000b8d,0x00000001,0x00000004,0x00000b88,0x0007000c,0x00000006,0x00000b90,
+    0x00000001,0x00000028,0x00000b8d,0x00000ac8,0x0004007c,0x0000001b,0x00000be2,0x00000b90,
+    0x00050082,0x0000001b,0x00000be3,0x000000a3,0x00000be2,0x0004007c,0x00000006,0x00000be4,
+    0x00000be3,0x00050083,0x00000006,0x00000b95,0x0000069e,0x00000696,0x00050085,0x00000006,
+    0x00000b98,0x00000b95,0x00000b84,0x00050081,0x00000006,0x00000b9b,0x00000ad6,0x00000b98,
+    0x00060052,0x0000000c,0x0000116f,0x00000b9b,0x0000129d,0x00000000,0x0006000c,0x00000006,
+    0x00000b9e,0x00000001,0x00000004,0x00000b95,0x00050085,0x00000006,0x00000ba0,0x00000b9e,
+    0x00000be4,0x0008000c,0x00000006,0x00000bef,0x00000001,0x0000002b,0x00000ba0,0x0000009b,
+    0x00000093,0x00050085,0x00000006,0x00000ba4,0x00000bef,0x00000bef,0x00050085,0x00000006,
+    0x00000ba7,0x00000ba4,0x00000b84,0x00050081,0x00000006,0x00000ba9,0x00000b08,0x00000ba7,
+    0x00050083,0x00000006,0x00000bac,0x000006a4,0x0000069c,0x0006000c,0x00000006,0x00000bb1,
+    0x00000001,0x00000004,0x00000bac,0x0007000c,0x00000006,0x00000bb4,0x00000001,0x00000028,
+    0x00000bb1,0x00000a27,0x0004007c,0x0000001b,0x00000bfb,0x00000bb4,0x00050082,0x0000001b,
+    0x00000bfc,0x000000a3,0x00000bfb,0x0004007c,0x00000006,0x00000bfd,0x00000bfc,0x00050083,
+    0x00000006,0x00000bb9,0x000006a4,0x000006a2,0x00050085,0x00000006,0x00000bbc,0x00000bb9,
+    0x00000b84,0x00050081,0x00000006,0x00000bbf,0x00000afa,0x00000bbc,0x00060052,0x0000000c,
+    0x00001172,0x00000bbf,0x0000116f,0x00000001,0x0006000c,0x00000006,0x00000bc2,0x00000001,
+    0x00000004,0x00000bb9,0x00050085,0x00000006,0x00000bc4,0x00000bc2,0x00000bfd,0x0008000c,
+    0x00000006,0x00000c08,0x00000001,0x0000002b,0x00000bc4,0x0000009b,0x00000093,0x00050085,
+    0x00000006,0x00000bc8,0x00000c08,0x00000c08,0x00050085,0x00000006,0x00000bcb,0x00000bc8,
+    0x00000b84,0x00050081,0x00000006,0x00000bcd,0x00000ba9,0x00000bcb,0x00050085,0x0000000c,
+    0x000006d7,0x00001172,0x00001172,0x00050051,0x00000006,0x000006d9,0x000006d7,0x00000000,
+    0x00050051,0x00000006,0x000006db,0x000006d7,0x00000001,0x00050081,0x00000006,0x000006dc,
+    0x000006d9,0x000006db,0x000500b8,0x0000004f,0x000006df,0x000006dc,0x000002f5,0x0004007c,
+    0x0000001b,0x00000c18,0x000006dc,0x000500c2,0x0000001b,0x00000c1a,0x00000c18,0x000000b1,
+    0x00050082,0x0000001b,0x00000c1b,0x000000ac,0x00000c1a,0x0004007c,0x00000006,0x00000c1c,
+    0x00000c1b,0x000200f9,0x000006e7,0x000200f8,0x000006e7,0x000600a9,0x00000006,0x0000129c,
+    0x000006df,0x00000093,0x00000c1c,0x000300f7,0x000006ef,0x00000000,0x000400fa,0x000006df,
+    0x000006ea,0x000006ec,0x000200f8,0x000006ec,0x000200f9,0x000006ef,0x000200f8,0x000006ea,
+    0x000200f9,0x000006ef,0x000200f8,0x000006ef,0x000700f5,0x00000006,0x0000127e,0x00000b9b,
+    0x000006ec,0x00000093,0x000006ea,0x00060052,0x0000000c,0x00001177,0x0000127e,0x00001172,
+    0x00000000,0x00050050,0x0000000c,0x00000c2d,0x0000129c,0x0000129c,0x00050085,0x0000000c,
+    0x000006f5,0x00001177,0x00000c2d,0x00050085,0x00000006,0x000006f8,0x00000bcd,0x00000230,
+    0x00050085,0x00000006,0x000006fb,0x000006f8,0x000006f8,0x00050051,0x00000006,0x000006fd,
+    0x000006f5,0x00000000,0x00050085,0x00000006,0x00000700,0x000006fd,0x000006fd,0x00050051,
+    0x00000006,0x00000702,0x000006f5,0x00000001,0x00050085,0x00000006,0x00000705,0x00000702,
+    0x00000702,0x00050081,0x00000006,0x00000706,0x00000700,0x00000705,0x0006000c,0x00000006,
+    0x00000709,0x00000001,0x00000004,0x000006fd,0x0006000c,0x00000006,0x0000070c,0x00000001,
+    0x00000004,0x00000702,0x0007000c,0x00000006,0x0000070d,0x00000001,0x00000028,0x00000709,
+    0x0000070c,0x0004007c,0x0000001b,0x00000c36,0x0000070d,0x00050082,0x0000001b,0x00000c37,
+    0x000000a3,0x00000c36,0x0004007c,0x00000006,0x00000c38,0x00000c37,0x00050085,0x00000006,
+    0x0000070f,0x00000706,0x00000c38,0x00050083,0x00000006,0x00000713,0x0000070f,0x00000093,
+    0x00050085,0x00000006,0x00000715,0x00000713,0x000006fb,0x00050081,0x00000006,0x00000716,
+    0x00000093,0x00000715,0x00050085,0x00000006,0x0000071a,0x0000033e,0x000006fb,0x00050081,
+    0x00000006,0x0000071b,0x00000093,0x0000071a,0x00050050,0x0000000c,0x0000071c,0x00000716,
+    0x0000071b,0x00050085,0x00000006,0x00000720,0x00000348,0x000006fb,0x00050081,0x00000006,
+    0x00000721,0x00000230,0x00000720,0x0004007c,0x0000001b,0x00000c53,0x00000721,0x00050082,
+    0x0000001b,0x00000c54,0x000000a3,0x00000c53,0x0004007c,0x00000006,0x00000c55,0x00000c54,
+    0x00050051,0x00000006,0x00000725,0x00000865,0x00000002,0x00050051,0x00000006,0x00000727,
+    0x0000086f,0x00000002,0x00050051,0x00000006,0x00000729,0x00000879,0x00000002,0x00060050,
+    0x00000011,0x0000072a,0x00000725,0x00000727,0x00000729,0x00050051,0x00000006,0x0000072c,
+    0x00000883,0x00000003,0x00050051,0x00000006,0x0000072e,0x0000088d,0x00000003,0x00050051,
+    0x00000006,0x00000730,0x00000897,0x00000003,0x00060050,0x00000011,0x00000731,0x0000072c,
+    0x0000072e,0x00000730,0x00050051,0x00000006,0x00000733,0x00000865,0x00000001,0x00050051,
+    0x00000006,0x00000735,0x0000086f,0x00000001,0x00050051,0x00000006,0x00000737,0x00000879,
+    0x00000001,0x00060050,0x00000011,0x00000738,0x00000733,0x00000735,0x00000737,0x0007000c,
+    0x00000011,0x00000c5e,0x00000001,0x00000025,0x00000731,0x00000738,0x0007000c,0x00000011,
+    0x00000c5f,0x00000001,0x00000025,0x0000072a,0x00000c5e,0x00050051,0x00000006,0x0000073b,
+    0x00000883,0x00000000,0x00050051,0x00000006,0x0000073d,0x0000088d,0x00000000,0x00050051,
+    0x00000006,0x0000073f,0x00000897,0x00000000,0x00060050,0x00000011,0x00000740,0x0000073b,
+    0x0000073d,0x0000073f,0x0007000c,0x00000011,0x00000741,0x00000001,0x00000025,0x00000c5f,
+    0x00000740,0x0007000c,0x00000011,0x00000c65,0x00000001,0x00000028,0x00000731,0x00000738,
+    0x0007000c,0x00000011,0x00000c66,0x00000001,0x00000028,0x0000072a,0x00000c65,0x0007000c,
+    0x00000011,0x0000075f,0x00000001,0x00000028,0x00000c66,0x00000740,0x00050083,0x0000000c,
+    0x00000763,0x0000039c,0x0000062b,0x00050051,0x00000006,0x00000765,0x00000847,0x00000000,
+    0x00050051,0x00000006,0x00000767,0x00000851,0x00000000,0x00050051,0x00000006,0x00000769,
+    0x0000085b,0x00000000,0x00060050,0x00000011,0x0000076a,0x00000765,0x00000767,0x00000769,
+    0x00050051,0x00000006,0x00000c7c,0x00000763,0x00000000,0x00050085,0x00000006,0x00000c7f,
+    0x00000c7c,0x000006fd,0x00050051,0x00000006,0x00000c81,0x00000763,0x00000001,0x00050085,
+    0x00000006,0x00000c84,0x00000c81,0x00000702,0x00050081,0x00000006,0x00000c85,0x00000c7f,
+    0x00000c84,0x00060052,0x0000000c,0x0000119e,0x00000c85,0x0000129d,0x00000000,0x0004007f,
+    0x00000006,0x00000c8b,0x00000702,0x00050085,0x00000006,0x00000c8c,0x00000c7c,0x00000c8b,
+    0x00050085,0x00000006,0x00000c91,0x00000c81,0x000006fd,0x00050081,0x00000006,0x00000c92,
+    0x00000c8c,0x00000c91,0x00060052,0x0000000c,0x000011a4,0x00000c92,0x0000119e,0x00000001,
+    0x00050085,0x0000000c,0x00000c96,0x000011a4,0x0000071c,0x00050051,0x00000006,0x00000c98,
+    0x00000c96,0x00000000,0x00050085,0x00000006,0x00000c9b,0x00000c98,0x00000c98,0x00050051,
+    0x00000006,0x00000c9d,0x00000c96,0x00000001,0x00050085,0x00000006,0x00000ca0,0x00000c9d,
+    0x00000c9d,0x00050081,0x00000006,0x00000ca1,0x00000c9b,0x00000ca0,0x0007000c,0x00000006,
+    0x00000ca4,0x00000001,0x00000025,0x00000ca1,0x00000c55,0x00050085,0x00000006,0x00000ca7,
+    0x0000010d,0x00000ca4,0x00050081,0x00000006,0x00000ca9,0x00000ca7,0x00000112,0x00050085,
+    0x00000006,0x00000cac,0x00000721,0x00000ca4,0x00050081,0x00000006,0x00000cae,0x00000cac,
+    0x00000112,0x00050085,0x00000006,0x00000cb1,0x00000ca9,0x00000ca9,0x00050085,0x00000006,
+    0x00000cb4,0x00000cae,0x00000cae,0x00050085,0x00000006,0x00000cb7,0x00000123,0x00000cb1,
+    0x00050081,0x00000006,0x00000cb9,0x00000cb7,0x00000128,0x00050085,0x00000006,0x00000cbc,
+    0x00000cb9,0x00000cb4,0x0005008e,0x00000011,0x00000cbf,0x0000076a,0x00000cbc,0x00050083,
+    0x0000000c,0x00000775,0x000003b7,0x0000062b,0x00050051,0x00000006,0x00000777,0x00000847,
+    0x00000001,0x00050051,0x00000006,0x00000779,0x00000851,0x00000001,0x00050051,0x00000006,
+    0x0000077b,0x0000085b,0x00000001,0x00060050,0x00000011,0x0000077c,0x00000777,0x00000779,
+    0x0000077b,0x00050051,0x00000006,0x00000ce0,0x00000775,0x00000000,0x00050085,0x00000006,
+    0x00000ce3,0x00000ce0,0x000006fd,0x00050051,0x00000006,0x00000ce5,0x00000775,0x00000001,
+    0x00050085,0x00000006,0x00000ce8,0x00000ce5,0x00000702,0x00050081,0x00000006,0x00000ce9,
+    0x00000ce3,0x00000ce8,0x00060052,0x0000000c,0x000011b1,0x00000ce9,0x0000129d,0x00000000,
+    0x00050085,0x00000006,0x00000cf0,0x00000ce0,0x00000c8b,0x00050085,0x00000006,0x00000cf5,
+    0x00000ce5,0x000006fd,0x00050081,0x00000006,0x00000cf6,0x00000cf0,0x00000cf5,0x00060052,
+    0x0000000c,0x000011b7,0x00000cf6,0x000011b1,0x00000001,0x00050085,0x0000000c,0x00000cfa,
+    0x000011b7,0x0000071c,0x00050051,0x00000006,0x00000cfc,0x00000cfa,0x00000000,0x00050085,
+    0x00000006,0x00000cff,0x00000cfc,0x00000cfc,0x00050051,0x00000006,0x00000d01,0x00000cfa,
+    0x00000001,0x00050085,0x00000006,0x00000d04,0x00000d01,0x00000d01,0x00050081,0x00000006,
+    0x00000d05,0x00000cff,0x00000d04,0x0007000c,0x00000006,0x00000d08,0x00000001,0x00000025,
+    0x00000d05,0x00000c55,0x00050085,0x00000006,0x00000d0b,0x0000010d,0x00000d08,0x00050081,
+    0x00000006,0x00000d0d,0x00000d0b,0x00000112,0x00050085,0x00000006,0x00000d10,0x00000721,
+    0x00000d08,0x00050081,0x00000006,0x00000d12,0x00000d10,0x00000112,0x00050085,0x00000006,
+    0x00000d15,0x00000d0d,0x00000d0d,0x00050085,0x00000006,0x00000d18,0x00000d12,0x00000d12,
+    0x00050085,0x00000006,0x00000d1b,0x00000123,0x00000d15,0x00050081,0x00000006,0x00000d1d,
+    0x00000d1b,0x00000128,0x00050085,0x00000006,0x00000d20,0x00000d1d,0x00000d18,0x0005008e,
+    0x00000011,0x00000d23,0x0000077c,0x00000d20,0x00050081,0x00000011,0x00000d25,0x00000cbf,
+    0x00000d23,0x00050081,0x00000006,0x00000d28,0x00000cbc,0x00000d20,0x00050083,0x0000000c,
+    0x00000787,0x000003d2,0x0000062b,0x00050051,0x00000006,0x00000789,0x00000865,0x00000000,
+    0x00050051,0x00000006,0x0000078b,0x0000086f,0x00000000,0x00050051,0x00000006,0x0000078d,
+    0x00000879,0x00000000,0x00060050,0x00000011,0x0000078e,0x00000789,0x0000078b,0x0000078d,
+    0x00050051,0x00000006,0x00000d44,0x00000787,0x00000000,0x00050085,0x00000006,0x00000d47,
+    0x00000d44,0x000006fd,0x00050051,0x00000006,0x00000d49,0x00000787,0x00000001,0x00050085,
+    0x00000006,0x00000d4c,0x00000d49,0x00000702,0x00050081,0x00000006,0x00000d4d,0x00000d47,
+    0x00000d4c,0x00060052,0x0000000c,0x000011c4,0x00000d4d,0x0000129d,0x00000000,0x00050085,
+    0x00000006,0x00000d54,0x00000d44,0x00000c8b,0x00050085,0x00000006,0x00000d59,0x00000d49,
+    0x000006fd,0x00050081,0x00000006,0x00000d5a,0x00000d54,0x00000d59,0x00060052,0x0000000c,
+    0x000011ca,0x00000d5a,0x000011c4,0x00000001,0x00050085,0x0000000c,0x00000d5e,0x000011ca,
+    0x0000071c,0x00050051,0x00000006,0x00000d60,0x00000d5e,0x00000000,0x00050085,0x00000006,
+    0x00000d63,0x00000d60,0x00000d60,0x00050051,0x00000006,0x00000d65,0x00000d5e,0x00000001,
+    0x00050085,0x00000006,0x00000d68,0x00000d65,0x00000d65,0x00050081,0x00000006,0x00000d69,
+    0x00000d63,0x00000d68,0x0007000c,0x00000006,0x00000d6c,0x00000001,0x00000025,0x00000d69,
+    0x00000c55,0x00050085,0x00000006,0x00000d6f,0x0000010d,0x00000d6c,0x00050081,0x00000006,
+    0x00000d71,0x00000d6f,0x00000112,0x00050085,0x00000006,0x00000d74,0x00000721,0x00000d6c,
+    0x00050081,0x00000006,0x00000d76,0x00000d74,0x00000112,0x00050085,0x00000006,0x00000d79,
+    0x00000d71,0x00000d71,0x00050085,0x00000006,0x00000d7c,0x00000d76,0x00000d76,0x00050085,
+    0x00000006,0x00000d7f,0x00000123,0x00000d79,0x00050081,0x00000006,0x00000d81,0x00000d7f,
+    0x00000128,0x00050085,0x00000006,0x00000d84,0x00000d81,0x00000d7c,0x0005008e,0x00000011,
+    0x00000d87,0x0000078e,0x00000d84,0x00050081,0x00000011,0x00000d89,0x00000d25,0x00000d87,
+    0x00050081,0x00000006,0x00000d8c,0x00000d28,0x00000d84,0x00050083,0x0000000c,0x00000799,
+    0x000003ed,0x0000062b,0x00050051,0x00000006,0x00000da8,0x00000799,0x00000000,0x00050085,
+    0x00000006,0x00000dab,0x00000da8,0x000006fd,0x00050051,0x00000006,0x00000dad,0x00000799,
+    0x00000001,0x00050085,0x00000006,0x00000db0,0x00000dad,0x00000702,0x00050081,0x00000006,
+    0x00000db1,0x00000dab,0x00000db0,0x00060052,0x0000000c,0x000011d7,0x00000db1,0x0000129d,
+    0x00000000,0x00050085,0x00000006,0x00000db8,0x00000da8,0x00000c8b,0x00050085,0x00000006,
+    0x00000dbd,0x00000dad,0x000006fd,0x00050081,0x00000006,0x00000dbe,0x00000db8,0x00000dbd,
+    0x00060052,0x0000000c,0x000011dd,0x00000dbe,0x000011d7,0x00000001,0x00050085,0x0000000c,
+    0x00000dc2,0x000011dd,0x0000071c,0x00050051,0x00000006,0x00000dc4,0x00000dc2,0x00000000,
+    0x00050085,0x00000006,0x00000dc7,0x00000dc4,0x00000dc4,0x00050051,0x00000006,0x00000dc9,
+    0x00000dc2,0x00000001,0x00050085,0x00000006,0x00000dcc,0x00000dc9,0x00000dc9,0x00050081,
+    0x00000006,0x00000dcd,0x00000dc7,0x00000dcc,0x0007000c,0x00000006,0x00000dd0,0x00000001,
+    0x00000025,0x00000dcd,0x00000c55,0x00050085,0x00000006,0x00000dd3,0x0000010d,0x00000dd0,
+    0x00050081,0x00000006,0x00000dd5,0x00000dd3,0x00000112,0x00050085,0x00000006,0x00000dd8,
+    0x00000721,0x00000dd0,0x00050081,0x00000006,0x00000dda,0x00000dd8,0x00000112,0x00050085,
+    0x00000006,0x00000ddd,0x00000dd5,0x00000dd5,0x00050085,0x00000006,0x00000de0,0x00000dda,
+    0x00000dda,0x00050085,0x00000006,0x00000de3,0x00000123,0x00000ddd,0x00050081,0x00000006,
+    0x00000de5,0x00000de3,0x00000128,0x00050085,0x00000006,0x00000de8,0x00000de5,0x00000de0,
+    0x0005008e,0x00000011,0x00000deb,0x00000738,0x00000de8,0x00050081,0x00000011,0x00000ded,
+    0x00000d89,0x00000deb,0x00050081,0x00000006,0x00000df0,0x00000d8c,0x00000de8,0x0004007f,
+    0x0000000c,0x000007ab,0x0000062b,0x00050051,0x00000006,0x00000e0c,0x000007ab,0x00000000,
+    0x00050085,0x00000006,0x00000e0f,0x00000e0c,0x000006fd,0x00050051,0x00000006,0x00000e11,
+    0x000007ab,0x00000001,0x00050085,0x00000006,0x00000e14,0x00000e11,0x00000702,0x00050081,
+    0x00000006,0x00000e15,0x00000e0f,0x00000e14,0x00060052,0x0000000c,0x000011ea,0x00000e15,
+    0x0000129d,0x00000000,0x00050085,0x00000006,0x00000e1c,0x00000e0c,0x00000c8b,0x00050085,
+    0x00000006,0x00000e21,0x00000e11,0x000006fd,0x00050081,0x00000006,0x00000e22,0x00000e1c,
+    0x00000e21,0x00060052,0x0000000c,0x000011f0,0x00000e22,0x000011ea,0x00000001,0x00050085,
+    0x0000000c,0x00000e26,0x000011f0,0x0000071c,0x00050051,0x00000006,0x00000e28,0x00000e26,
+    0x00000000,0x00050085,0x00000006,0x00000e2b,0x00000e28,0x00000e28,0x00050051,0x00000006,
+    0x00000e2d,0x00000e26,0x00000001,0x00050085,0x00000006,0x00000e30,0x00000e2d,0x00000e2d,
+    0x00050081,0x00000006,0x00000e31,0x00000e2b,0x00000e30,0x0007000c,0x00000006,0x00000e34,
+    0x00000001,0x00000025,0x00000e31,0x00000c55,0x00050085,0x00000006,0x00000e37,0x0000010d,
+    0x00000e34,0x00050081,0x00000006,0x00000e39,0x00000e37,0x00000112,0x00050085,0x00000006,
+    0x00000e3c,0x00000721,0x00000e34,0x00050081,0x00000006,0x00000e3e,0x00000e3c,0x00000112,
+    0x00050085,0x00000006,0x00000e41,0x00000e39,0x00000e39,0x00050085,0x00000006,0x00000e44,
+    0x00000e3e,0x00000e3e,0x00050085,0x00000006,0x00000e47,0x00000123,0x00000e41,0x00050081,
+    0x00000006,0x00000e49,0x00000e47,0x00000128,0x00050085,0x00000006,0x00000e4c,0x00000e49,
+    0x00000e44,0x0005008e,0x00000011,0x00000e4f,0x0000072a,0x00000e4c,0x00050081,0x00000011,
+    0x00000e51,0x00000ded,0x00000e4f,0x00050081,0x00000006,0x00000e54,0x00000df0,0x00000e4c,
+    0x00050083,0x0000000c,0x000007bd,0x00000423,0x0000062b,0x00050051,0x00000006,0x000007bf,
+    0x00000865,0x00000003,0x00050051,0x00000006,0x000007c1,0x0000086f,0x00000003,0x00050051,
+    0x00000006,0x000007c3,0x00000879,0x00000003,0x00060050,0x00000011,0x000007c4,0x000007bf,
+    0x000007c1,0x000007c3,0x00050051,0x00000006,0x00000e70,0x000007bd,0x00000000,0x00050085,
+    0x00000006,0x00000e73,0x00000e70,0x000006fd,0x00050051,0x00000006,0x00000e75,0x000007bd,
+    0x00000001,0x00050085,0x00000006,0x00000e78,0x00000e75,0x00000702,0x00050081,0x00000006,
+    0x00000e79,0x00000e73,0x00000e78,0x00060052,0x0000000c,0x000011fd,0x00000e79,0x0000129d,
+    0x00000000,0x00050085,0x00000006,0x00000e80,0x00000e70,0x00000c8b,0x00050085,0x00000006,
+    0x00000e85,0x00000e75,0x000006fd,0x00050081,0x00000006,0x00000e86,0x00000e80,0x00000e85,
+    0x00060052,0x0000000c,0x00001203,0x00000e86,0x000011fd,0x00000001,0x00050085,0x0000000c,
+    0x00000e8a,0x00001203,0x0000071c,0x00050051,0x00000006,0x00000e8c,0x00000e8a,0x00000000,
+    0x00050085,0x00000006,0x00000e8f,0x00000e8c,0x00000e8c,0x00050051,0x00000006,0x00000e91,
+    0x00000e8a,0x00000001,0x00050085,0x00000006,0x00000e94,0x00000e91,0x00000e91,0x00050081,
+    0x00000006,0x00000e95,0x00000e8f,0x00000e94,0x0007000c,0x00000006,0x00000e98,0x00000001,
+    0x00000025,0x00000e95,0x00000c55,0x00050085,0x00000006,0x00000e9b,0x0000010d,0x00000e98,
+    0x00050081,0x00000006,0x00000e9d,0x00000e9b,0x00000112,0x00050085,0x00000006,0x00000ea0,
+    0x00000721,0x00000e98,0x00050081,0x00000006,0x00000ea2,0x00000ea0,0x00000112,0x00050085,
+    0x00000006,0x00000ea5,0x00000e9d,0x00000e9d,0x00050085,0x00000006,0x00000ea8,0x00000ea2,
+    0x00000ea2,0x00050085,0x00000006,0x00000eab,0x00000123,0x00000ea5,0x00050081,0x00000006,
+    0x00000ead,0x00000eab,0x00000128,0x00050085,0x00000006,0x00000eb0,0x00000ead,0x00000ea8,
+    0x0005008e,0x00000011,0x00000eb3,0x000007c4,0x00000eb0,0x00050081,0x00000011,0x00000eb5,
+    0x00000e51,0x00000eb3,0x00050081,0x00000006,0x00000eb8,0x00000e54,0x00000eb0,0x00050083,
+    0x0000000c,0x000007cf,0x0000043e,0x0000062b,0x00050051,0x00000006,0x00000ed4,0x000007cf,
+    0x00000000,0x00050085,0x00000006,0x00000ed7,0x00000ed4,0x000006fd,0x00050051,0x00000006,
+    0x00000ed9,0x000007cf,0x00000001,0x00050085,0x00000006,0x00000edc,0x00000ed9,0x00000702,
+    0x00050081,0x00000006,0x00000edd,0x00000ed7,0x00000edc,0x00060052,0x0000000c,0x00001210,
+    0x00000edd,0x0000129d,0x00000000,0x00050085,0x00000006,0x00000ee4,0x00000ed4,0x00000c8b,
+    0x00050085,0x00000006,0x00000ee9,0x00000ed9,0x000006fd,0x00050081,0x00000006,0x00000eea,
+    0x00000ee4,0x00000ee9,0x00060052,0x0000000c,0x00001216,0x00000eea,0x00001210,0x00000001,
+    0x00050085,0x0000000c,0x00000eee,0x00001216,0x0000071c,0x00050051,0x00000006,0x00000ef0,
+    0x00000eee,0x00000000,0x00050085,0x00000006,0x00000ef3,0x00000ef0,0x00000ef0,0x00050051,
+    0x00000006,0x00000ef5,0x00000eee,0x00000001,0x00050085,0x00000006,0x00000ef8,0x00000ef5,
+    0x00000ef5,0x00050081,0x00000006,0x00000ef9,0x00000ef3,0x00000ef8,0x0007000c,0x00000006,
+    0x00000efc,0x00000001,0x00000025,0x00000ef9,0x00000c55,0x00050085,0x00000006,0x00000eff,
+    0x0000010d,0x00000efc,0x00050081,0x00000006,0x00000f01,0x00000eff,0x00000112,0x00050085,
+    0x00000006,0x00000f04,0x00000721,0x00000efc,0x00050081,0x00000006,0x00000f06,0x00000f04,
+    0x00000112,0x00050085,0x00000006,0x00000f09,0x00000f01,0x00000f01,0x00050085,0x00000006,
+    0x00000f0c,0x00000f06,0x00000f06,0x00050085,0x00000006,0x00000f0f,0x00000123,0x00000f09,
+    0x00050081,0x00000006,0x00000f11,0x00000f0f,0x00000128,0x00050085,0x00000006,0x00000f14,
+    0x00000f11,0x00000f0c,0x0005008e,0x00000011,0x00000f17,0x00000740,0x00000f14,0x00050081,
+    0x00000011,0x00000f19,0x00000eb5,0x00000f17,0x00050081,0x00000006,0x00000f1c,0x00000eb8,
+    0x00000f14,0x00050083,0x0000000c,0x000007e1,0x0000045a,0x0000062b,0x00050051,0x00000006,
+    0x000007e3,0x00000883,0x00000001,0x00050051,0x00000006,0x000007e5,0x0000088d,0x00000001,
+    0x00050051,0x00000006,0x000007e7,0x00000897,0x00000001,0x00060050,0x00000011,0x000007e8,
+    0x000007e3,0x000007e5,0x000007e7,0x00050051,0x00000006,0x00000f38,0x000007e1,0x00000000,
+    0x00050085,0x00000006,0x00000f3b,0x00000f38,0x000006fd,0x00050051,0x00000006,0x00000f3d,
+    0x000007e1,0x00000001,0x00050085,0x00000006,0x00000f40,0x00000f3d,0x00000702,0x00050081,
+    0x00000006,0x00000f41,0x00000f3b,0x00000f40,0x00060052,0x0000000c,0x00001223,0x00000f41,
+    0x0000129d,0x00000000,0x00050085,0x00000006,0x00000f48,0x00000f38,0x00000c8b,0x00050085,
+    0x00000006,0x00000f4d,0x00000f3d,0x000006fd,0x00050081,0x00000006,0x00000f4e,0x00000f48,
+    0x00000f4d,0x00060052,0x0000000c,0x00001229,0x00000f4e,0x00001223,0x00000001,0x00050085,
+    0x0000000c,0x00000f52,0x00001229,0x0000071c,0x00050051,0x00000006,0x00000f54,0x00000f52,
+    0x00000000,0x00050085,0x00000006,0x00000f57,0x00000f54,0x00000f54,0x00050051,0x00000006,
+    0x00000f59,0x00000f52,0x00000001,0x00050085,0x00000006,0x00000f5c,0x00000f59,0x00000f59,
+    0x00050081,0x00000006,0x00000f5d,0x00000f57,0x00000f5c,0x0007000c,0x00000006,0x00000f60,
+    0x00000001,0x00000025,0x00000f5d,0x00000c55,0x00050085,0x00000006,0x00000f63,0x0000010d,
+    0x00000f60,0x00050081,0x00000006,0x00000f65,0x00000f63,0x00000112,0x00050085,0x00000006,
+    0x00000f68,0x00000721,0x00000f60,0x00050081,0x00000006,0x00000f6a,0x00000f68,0x00000112,
+    0x00050085,0x00000006,0x00000f6d,0x00000f65,0x00000f65,0x00050085,0x00000006,0x00000f70,
+    0x00000f6a,0x00000f6a,0x00050085,0x00000006,0x00000f73,0x00000123,0x00000f6d,0x00050081,
+    0x00000006,0x00000f75,0x00000f73,0x00000128,0x00050085,0x00000006,0x00000f78,0x00000f75,
+    0x00000f70,0x0005008e,0x00000011,0x00000f7b,0x000007e8,0x00000f78,0x00050081,0x00000011,
+    0x00000f7d,0x00000f19,0x00000f7b,0x00050081,0x00000006,0x00000f80,0x00000f1c,0x00000f78,
+    0x00050083,0x0000000c,0x000007f3,0x00000475,0x0000062b,0x00050051,0x00000006,0x000007f5,
+    0x00000883,0x00000002,0x00050051,0x00000006,0x000007f7,0x0000088d,0x00000002,0x00050051,
+    0x00000006,0x000007f9,0x00000897,0x00000002,0x00060050,0x00000011,0x000007fa,0x000007f5,
+    0x000007f7,0x000007f9,0x00050051,0x00000006,0x00000f9c,0x000007f3,0x00000000,0x00050085,
+    0x00000006,0x00000f9f,0x00000f9c,0x000006fd,0x00050051,0x00000006,0x00000fa1,0x000007f3,
+    0x00000001,0x00050085,0x00000006,0x00000fa4,0x00000fa1,0x00000702,0x00050081,0x00000006,
+    0x00000fa5,0x00000f9f,0x00000fa4,0x00060052,0x0000000c,0x00001236,0x00000fa5,0x0000129d,
+    0x00000000,0x00050085,0x00000006,0x00000fac,0x00000f9c,0x00000c8b,0x00050085,0x00000006,
+    0x00000fb1,0x00000fa1,0x000006fd,0x00050081,0x00000006,0x00000fb2,0x00000fac,0x00000fb1,
+    0x00060052,0x0000000c,0x0000123c,0x00000fb2,0x00001236,0x00000001,0x00050085,0x0000000c,
+    0x00000fb6,0x0000123c,0x0000071c,0x00050051,0x00000006,0x00000fb8,0x00000fb6,0x00000000,
+    0x00050085,0x00000006,0x00000fbb,0x00000fb8,0x00000fb8,0x00050051,0x00000006,0x00000fbd,
+    0x00000fb6,0x00000001,0x00050085,0x00000006,0x00000fc0,0x00000fbd,0x00000fbd,0x00050081,
+    0x00000006,0x00000fc1,0x00000fbb,0x00000fc0,0x0007000c,0x00000006,0x00000fc4,0x00000001,
+    0x00000025,0x00000fc1,0x00000c55,0x00050085,0x00000006,0x00000fc7,0x0000010d,0x00000fc4,
+    0x00050081,0x00000006,0x00000fc9,0x00000fc7,0x00000112,0x00050085,0x00000006,0x00000fcc,
+    0x00000721,0x00000fc4,0x00050081,0x00000006,0x00000fce,0x00000fcc,0x00000112,0x00050085,
+    0x00000006,0x00000fd1,0x00000fc9,0x00000fc9,0x00050085,0x00000006,0x00000fd4,0x00000fce,
+    0x00000fce,0x00050085,0x00000006,0x00000fd7,0x00000123,0x00000fd1,0x00050081,0x00000006,
+    0x00000fd9,0x00000fd7,0x00000128,0x00050085,0x00000006,0x00000fdc,0x00000fd9,0x00000fd4,
+    0x0005008e,0x00000011,0x00000fdf,0x000007fa,0x00000fdc,0x00050081,0x00000011,0x00000fe1,
+    0x00000f7d,0x00000fdf,0x00050081,0x00000006,0x00000fe4,0x00000f80,0x00000fdc,0x00050083,
+    0x0000000c,0x00000805,0x00000490,0x0000062b,0x00050051,0x00000006,0x00001000,0x00000805,
+    0x00000000,0x00050085,0x00000006,0x00001003,0x00001000,0x000006fd,0x00050051,0x00000006,
+    0x00001005,0x00000805,0x00000001,0x00050085,0x00000006,0x00001008,0x00001005,0x00000702,
+    0x00050081,0x00000006,0x00001009,0x00001003,0x00001008,0x00060052,0x0000000c,0x00001249,
+    0x00001009,0x0000129d,0x00000000,0x00050085,0x00000006,0x00001010,0x00001000,0x00000c8b,
+    0x00050085,0x00000006,0x00001015,0x00001005,0x000006fd,0x00050081,0x00000006,0x00001016,
+    0x00001010,0x00001015,0x00060052,0x0000000c,0x0000124f,0x00001016,0x00001249,0x00000001,
+    0x00050085,0x0000000c,0x0000101a,0x0000124f,0x0000071c,0x00050051,0x00000006,0x0000101c,
+    0x0000101a,0x00000000,0x00050085,0x00000006,0x0000101f,0x0000101c,0x0000101c,0x00050051,
+    0x00000006,0x00001021,0x0000101a,0x00000001,0x00050085,0x00000006,0x00001024,0x00001021,
+    0x00001021,0x00050081,0x00000006,0x00001025,0x0000101f,0x00001024,0x0007000c,0x00000006,
+    0x00001028,0x00000001,0x00000025,0x00001025,0x00000c55,0x00050085,0x00000006,0x0000102b,
+    0x0000010d,0x00001028,0x00050081,0x00000006,0x0000102d,0x0000102b,0x00000112,0x00050085,
+    0x00000006,0x00001030,0x00000721,0x00001028,0x00050081,0x00000006,0x00001032,0x00001030,
+    0x00000112,0x00050085,0x00000006,0x00001035,0x0000102d,0x0000102d,0x00050085,0x00000006,
+    0x00001038,0x00001032,0x00001032,0x00050085,0x00000006,0x0000103b,0x00000123,0x00001035,
+    0x00050081,0x00000006,0x0000103d,0x0000103b,0x00000128,0x00050085,0x00000006,0x00001040,
+    0x0000103d,0x00001038,0x0005008e,0x00000011,0x00001043,0x00000731,0x00001040,0x00050081,
+    0x00000011,0x00001045,0x00000fe1,0x00001043,0x00050081,0x00000006,0x00001048,0x00000fe4,
+    0x00001040,0x00050083,0x0000000c,0x00000817,0x000004ab,0x0000062b,0x00050051,0x00000006,
+    0x00000819,0x000008a1,0x00000002,0x00050051,0x00000006,0x0000081b,0x000008ab,0x00000002,
+    0x00050051,0x00000006,0x0000081d,0x000008b5,0x00000002,0x00060050,0x00000011,0x0000081e,
+    0x00000819,0x0000081b,0x0000081d,0x00050051,0x00000006,0x00001064,0x00000817,0x00000000,
+    0x00050085,0x00000006,0x00001067,0x00001064,0x000006fd,0x00050051,0x00000006,0x00001069,
+    0x00000817,0x00000001,0x00050085,0x00000006,0x0000106c,0x00001069,0x00000702,0x00050081,
+    0x00000006,0x0000106d,0x00001067,0x0000106c,0x00060052,0x0000000c,0x0000125c,0x0000106d,
+    0x0000129d,0x00000000,0x00050085,0x00000006,0x00001074,0x00001064,0x00000c8b,0x00050085,
+    0x00000006,0x00001079,0x00001069,0x000006fd,0x00050081,0x00000006,0x0000107a,0x00001074,
+    0x00001079,0x00060052,0x0000000c,0x00001262,0x0000107a,0x0000125c,0x00000001,0x00050085,
+    0x0000000c,0x0000107e,0x00001262,0x0000071c,0x00050051,0x00000006,0x00001080,0x0000107e,
+    0x00000000,0x00050085,0x00000006,0x00001083,0x00001080,0x00001080,0x00050051,0x00000006,
+    0x00001085,0x0000107e,0x00000001,0x00050085,0x00000006,0x00001088,0x00001085,0x00001085,
+    0x00050081,0x00000006,0x00001089,0x00001083,0x00001088,0x0007000c,0x00000006,0x0000108c,
+    0x00000001,0x00000025,0x00001089,0x00000c55,0x00050085,0x00000006,0x0000108f,0x0000010d,
+    0x0000108c,0x00050081,0x00000006,0x00001091,0x0000108f,0x00000112,0x00050085,0x00000006,
+    0x00001094,0x00000721,0x0000108c,0x00050081,0x00000006,0x00001096,0x00001094,0x00000112,
+    0x00050085,0x00000006,0x00001099,0x00001091,0x00001091,0x00050085,0x00000006,0x0000109c,
+    0x00001096,0x00001096,0x00050085,0x00000006,0x0000109f,0x00000123,0x00001099,0x00050081,
+    0x00000006,0x000010a1,0x0000109f,0x00000128,0x00050085,0x00000006,0x000010a4,0x000010a1,
+    0x0000109c,0x0005008e,0x00000011,0x000010a7,0x0000081e,0x000010a4,0x00050081,0x00000011,
+    0x000010a9,0x00001045,0x000010a7,0x00050081,0x00000006,0x000010ac,0x00001048,0x000010a4,
+    0x00050083,0x0000000c,0x00000829,0x000004c6,0x0000062b,0x00050051,0x00000006,0x0000082b,
+    0x000008a1,0x00000003,0x00050051,0x00000006,0x0000082d,0x000008ab,0x00000003,0x00050051,
+    0x00000006,0x0000082f,0x000008b5,0x00000003,0x00060050,0x00000011,0x00000830,0x0000082b,
+    0x0000082d,0x0000082f,0x00050051,0x00000006,0x000010c8,0x00000829,0x00000000,0x00050085,
+    0x00000006,0x000010cb,0x000010c8,0x000006fd,0x00050051,0x00000006,0x000010cd,0x00000829,
+    0x00000001,0x00050085,0x00000006,0x000010d0,0x000010cd,0x00000702,0x00050081,0x00000006,
+    0x000010d1,0x000010cb,0x000010d0,0x00060052,0x0000000c,0x0000126f,0x000010d1,0x0000129d,
+    0x00000000,0x00050085,0x00000006,0x000010d8,0x000010c8,0x00000c8b,0x00050085,0x00000006,
+    0x000010dd,0x000010cd,0x000006fd,0x00050081,0x00000006,0x000010de,0x000010d8,0x000010dd,
+    0x00060052,0x0000000c,0x00001275,0x000010de,0x0000126f,0x00000001,0x00050085,0x0000000c,
+    0x000010e2,0x00001275,0x0000071c,0x00050051,0x00000006,0x000010e4,0x000010e2,0x00000000,
+    0x00050085,0x00000006,0x000010e7,0x000010e4,0x000010e4,0x00050051,0x00000006,0x000010e9,
+    0x000010e2,0x00000001,0x00050085,0x00000006,0x000010ec,0x000010e9,0x000010e9,0x00050081,
+    0x00000006,0x000010ed,0x000010e7,0x000010ec,0x0007000c,0x00000006,0x000010f0,0x00000001,
+    0x00000025,0x000010ed,0x00000c55,0x00050085,0x00000006,0x000010f3,0x0000010d,0x000010f0,
+    0x00050081,0x00000006,0x000010f5,0x000010f3,0x00000112,0x00050085,0x00000006,0x000010f8,
+    0x00000721,0x000010f0,0x00050081,0x00000006,0x000010fa,0x000010f8,0x00000112,0x00050085,
+    0x00000006,0x000010fd,0x000010f5,0x000010f5,0x00050085,0x00000006,0x00001100,0x000010fa,
+    0x000010fa,0x00050085,0x00000006,0x00001103,0x00000123,0x000010fd,0x00050081,0x00000006,
+    0x00001105,0x00001103,0x00000128,0x00050085,0x00000006,0x00001108,0x00001105,0x00001100,
+    0x0005008e,0x00000011,0x0000110b,0x00000830,0x00001108,0x00050081,0x00000011,0x0000110d,
+    0x000010a9,0x0000110b,0x00050081,0x00000006,0x00001110,0x000010ac,0x00001108,0x00050088,
+    0x00000006,0x00001125,0x00000093,0x00001110,0x00060050,0x00000011,0x0000112e,0x00001125,
+    0x00001125,0x00001125,0x00050085,0x00000011,0x00000840,0x0000110d,0x0000112e,0x0007000c,
+    0x00000011,0x00000841,0x00000001,0x00000028,0x00000741,0x00000840,0x0007000c,0x00000011,
+    0x00000842,0x00000001,0x00000025,0x0000075f,0x00000841,0x0004003d,0x00000515,0x00000518,
+    0x00000517,0x0004007c,0x0000051b,0x0000051c,0x000004f0,0x00050051,0x00000006,0x0000051e,
+    0x00000842,0x00000000,0x00050051,0x00000006,0x0000051f,0x00000842,0x00000001,0x00050051,
+    0x00000006,0x00000520,0x00000842,0x00000002,0x00070050,0x00000016,0x00000521,0x0000051e,
+    0x0000051f,0x00000520,0x00000093,0x00040063,0x00000518,0x0000051c,0x00000521,0x000200f9,
+    0x00000524,0x000200f8,0x00000524,0x000100fd,0x00010038
+};
+
+/*
+#version 460
+#extension GL_GOOGLE_include_directive: require
+
+layout(local_size_x=8, local_size_y=8, local_size_z=1) in;
+
+layout(binding = 0) uniform sampler2D texSampler;
+layout(binding = 1) uniform writeonly image2D outImage;
+
+layout(push_constant) uniform pushConstants {
+    uvec2 c1;
+    ivec2 extent;
+    ivec4 viewport;
+};
+
+#define A_GPU 1
+#define A_GLSL 1
+//#include "ffx_a.h"
+#define FSR_RCAS_F 1
+vec4 FsrRcasLoadF(ivec2 p) { return texelFetch(texSampler, clamp(p, ivec2(0), extent), 0); }
+void FsrRcasInputF(inout float r, inout float g, inout float b) {}
+//#include "ffx_fsr1.h"
+
+
+void main()
+{
+    vec3 color;
+
+    if (any(lessThan(gl_GlobalInvocationID.xy, uvec2(viewport.xy))) ||
+        any(greaterThan(gl_GlobalInvocationID.xy, uvec2(viewport.zw))))
+    {
+        color = vec3(0.0, 0.0, 0.0);
+    }
+    else
+    {
+        FsrRcasF(color.r, color.g, color.b, uvec2(gl_GlobalInvocationID.xy - viewport.xy), c1.xyxx);
+    }
+
+    imageStore(outImage, ivec2(gl_GlobalInvocationID.xy), vec4(color, 1.0));
+}
+*/
+const uint32_t fsr_rcas_comp_spv[] = {
+    0x07230203,0x00010000,0x0008000a,0x0000061e,0x00000000,0x00020011,0x00000001,0x00020011,
+    0x00000038,0x0006000b,0x00000001,0x4c534c47,0x6474732e,0x3035342e,0x00000000,0x0003000e,
+    0x00000000,0x00000001,0x0006000f,0x00000005,0x00000004,0x6e69616d,0x00000000,0x00000287,
+    0x00060010,0x00000004,0x00000011,0x00000008,0x00000008,0x00000001,0x00030003,0x00000002,
+    0x000001cc,0x000a0004,0x475f4c47,0x4c474f4f,0x70635f45,0x74735f70,0x5f656c79,0x656e696c,
+    0x7269645f,0x69746365,0x00006576,0x00080004,0x475f4c47,0x4c474f4f,0x6e695f45,0x64756c63,
+    0x69645f65,0x74636572,0x00657669,0x00040005,0x00000004,0x6e69616d,0x00000000,0x00050005,
+    0x0000007b,0x53786574,0x6c706d61,0x00007265,0x00060005,0x00000081,0x68737570,0x736e6f43,
+    0x746e6174,0x00000073,0x00040006,0x00000081,0x00000000,0x00003163,0x00050006,0x00000081,
+    0x00000001,0x65747865,0x0000746e,0x00060006,0x00000081,0x00000002,0x77656976,0x74726f70,
+    0x00000000,0x00030005,0x00000083,0x00000000,0x00080005,0x00000287,0x475f6c67,0x61626f6c,
+    0x766e496c,0x7461636f,0x496e6f69,0x00000044,0x00050005,0x000002c0,0x4974756f,0x6567616d,
+    0x00000000,0x00040047,0x0000007b,0x00000022,0x00000000,0x00040047,0x0000007b,0x00000021,
+    0x00000000,0x00050048,0x00000081,0x00000000,0x00000023,0x00000000,0x00050048,0x00000081,
+    0x00000001,0x00000023,0x00000008,0x00050048,0x00000081,0x00000002,0x00000023,0x00000010,
+    0x00030047,0x00000081,0x00000002,0x00040047,0x00000287,0x0000000b,0x0000001c,0x00040047,
+    0x000002c0,0x00000022,0x00000000,0x00040047,0x000002c0,0x00000021,0x00000001,0x00030047,
+    0x000002c0,0x00000019,0x00040047,0x000002cb,0x0000000b,0x00000019,0x00020013,0x00000002,
+    0x00030021,0x00000003,0x00000002,0x00030016,0x00000006,0x00000020,0x00040015,0x0000000c,
+    0x00000020,0x00000000,0x00040015,0x00000026,0x00000020,0x00000001,0x00040017,0x00000027,
+    0x00000026,0x00000002,0x00040017,0x00000029,0x00000006,0x00000004,0x00040017,0x00000034,
+    0x0000000c,0x00000002,0x0004002b,0x00000006,0x00000054,0x3f800000,0x0004002b,0x00000006,
+    0x0000005c,0x00000000,0x0004002b,0x0000000c,0x00000065,0x7ef19fff,0x0004002b,0x00000006,
+    0x00000071,0x40000000,0x00090019,0x00000078,0x00000006,0x00000001,0x00000000,0x00000000,
+    0x00000000,0x00000001,0x00000000,0x0003001b,0x00000079,0x00000078,0x00040020,0x0000007a,
+    0x00000000,0x00000079,0x0004003b,0x0000007a,0x0000007b,0x00000000,0x0004002b,0x00000026,
+    0x0000007e,0x00000000,0x0005002c,0x00000027,0x0000007f,0x0000007e,0x0000007e,0x00040017,
+    0x00000080,0x00000026,0x00000004,0x0005001e,0x00000081,0x00000034,0x00000027,0x00000080,
+    0x00040020,0x00000082,0x00000009,0x00000081,0x0004003b,0x00000082,0x00000083,0x00000009,
+    0x0004002b,0x00000026,0x00000084,0x00000001,0x00040020,0x00000085,0x00000009,0x00000027,
+    0x00040017,0x00000090,0x00000006,0x00000003,0x0004002b,0x00000026,0x00000094,0xffffffff,
+    0x0005002c,0x00000027,0x00000095,0x0000007e,0x00000094,0x0005002c,0x00000027,0x0000009c,
+    0x00000094,0x0000007e,0x0005002c,0x00000027,0x000000a8,0x00000084,0x0000007e,0x0005002c,
+    0x00000027,0x000000af,0x0000007e,0x00000084,0x0004002b,0x0000000c,0x000000b9,0x00000001,
+    0x0004002b,0x00000006,0x00000154,0x3e800000,0x0004002b,0x00000006,0x000001d3,0xc0800000,
+    0x0004002b,0x00000006,0x000001d7,0x40800000,0x0004002b,0x00000006,0x0000022e,0xbe400000,
+    0x00020014,0x00000284,0x00040017,0x00000285,0x0000000c,0x00000003,0x00040020,0x00000286,
+    0x00000001,0x00000285,0x0004003b,0x00000286,0x00000287,0x00000001,0x0004002b,0x00000026,
+    0x0000028a,0x00000002,0x00040020,0x0000028b,0x00000009,0x00000080,0x00040017,0x00000290,
+    0x00000284,0x00000002,0x0006002c,0x00000090,0x000002a2,0x0000005c,0x0000005c,0x0000005c,
+    0x00040020,0x000002b3,0x00000009,0x00000034,0x00090019,0x000002be,0x00000006,0x00000001,
+    0x00000000,0x00000000,0x00000000,0x00000002,0x00000000,0x00040020,0x000002bf,0x00000000,
+    0x000002be,0x0004003b,0x000002bf,0x000002c0,0x00000000,0x0004002b,0x0000000c,0x000002ca,
+    0x00000008,0x0006002c,0x00000285,0x000002cb,0x000002ca,0x000002ca,0x000000b9,0x00030001,
+    0x00000090,0x0000061d,0x00050036,0x00000002,0x00000004,0x00000000,0x00000003,0x000200f8,
+    0x00000005,0x0004003d,0x00000285,0x00000288,0x00000287,0x0007004f,0x00000034,0x00000289,
+    0x00000288,0x00000288,0x00000000,0x00000001,0x00050041,0x0000028b,0x0000028c,0x00000083,
+    0x0000028a,0x0004003d,0x00000080,0x0000028d,0x0000028c,0x0007004f,0x00000027,0x0000028e,
+    0x0000028d,0x0000028d,0x00000000,0x00000001,0x0004007c,0x00000034,0x0000028f,0x0000028e,
+    0x000500b0,0x00000290,0x00000291,0x00000289,0x0000028f,0x0004009a,0x00000284,0x00000292,
+    0x00000291,0x000400a8,0x00000284,0x00000293,0x00000292,0x000300f7,0x00000295,0x00000000,
+    0x000400fa,0x00000293,0x00000294,0x00000295,0x000200f8,0x00000294,0x0007004f,0x00000027,
+    0x0000029a,0x0000028d,0x0000028d,0x00000002,0x00000003,0x0004007c,0x00000034,0x0000029b,
+    0x0000029a,0x000500ac,0x00000290,0x0000029c,0x00000289,0x0000029b,0x0004009a,0x00000284,
+    0x0000029d,0x0000029c,0x000200f9,0x00000295,0x000200f8,0x00000295,0x000700f5,0x00000284,
+    0x0000029e,0x00000292,0x00000005,0x0000029d,0x00000294,0x000300f7,0x000002a0,0x00000000,
+    0x000400fa,0x0000029e,0x0000029f,0x000002a3,0x000200f8,0x0000029f,0x000200f9,0x000002a0,
+    0x000200f8,0x000002a3,0x00050082,0x00000034,0x000002aa,0x00000289,0x0000028f,0x00050041,
+    0x000002b3,0x000002b4,0x00000083,0x0000007e,0x0004003d,0x00000034,0x000002b5,0x000002b4,
+    0x0004007c,0x00000027,0x00000353,0x000002aa,0x00050080,0x00000027,0x00000355,0x00000353,
+    0x00000095,0x0004003d,0x00000079,0x000004b3,0x0000007b,0x00050041,0x00000085,0x000004b5,
+    0x00000083,0x00000084,0x0004003d,0x00000027,0x000004b6,0x000004b5,0x0008000c,0x00000027,
+    0x000004b7,0x00000001,0x0000002d,0x00000355,0x0000007f,0x000004b6,0x00040064,0x00000078,
+    0x000004b8,0x000004b3,0x0007005f,0x00000029,0x000004b9,0x000004b8,0x000004b7,0x00000002,
+    0x0000007e,0x00050080,0x00000027,0x00000359,0x00000353,0x0000009c,0x0008000c,0x00000027,
+    0x000004c0,0x00000001,0x0000002d,0x00000359,0x0000007f,0x000004b6,0x00040064,0x00000078,
+    0x000004c1,0x000004b3,0x0007005f,0x00000029,0x000004c2,0x000004c1,0x000004c0,0x00000002,
+    0x0000007e,0x0008000c,0x00000027,0x000004c9,0x00000001,0x0000002d,0x00000353,0x0000007f,
+    0x000004b6,0x00040064,0x00000078,0x000004ca,0x000004b3,0x0007005f,0x00000029,0x000004cb,
+    0x000004ca,0x000004c9,0x00000002,0x0000007e,0x00050080,0x00000027,0x00000360,0x00000353,
+    0x000000a8,0x0008000c,0x00000027,0x000004d2,0x00000001,0x0000002d,0x00000360,0x0000007f,
+    0x000004b6,0x00040064,0x00000078,0x000004d3,0x000004b3,0x0007005f,0x00000029,0x000004d4,
+    0x000004d3,0x000004d2,0x00000002,0x0000007e,0x00050080,0x00000027,0x00000364,0x00000353,
+    0x000000af,0x0008000c,0x00000027,0x000004db,0x00000001,0x0000002d,0x00000364,0x0000007f,
+    0x000004b6,0x00040064,0x00000078,0x000004dc,0x000004b3,0x0007005f,0x00000029,0x000004dd,
+    0x000004dc,0x000004db,0x00000002,0x0000007e,0x00050051,0x00000006,0x00000368,0x000004b9,
+    0x00000000,0x00050051,0x00000006,0x0000036a,0x000004b9,0x00000001,0x00050051,0x00000006,
+    0x0000036c,0x000004b9,0x00000002,0x00050051,0x00000006,0x0000036e,0x000004c2,0x00000000,
+    0x00050051,0x00000006,0x00000370,0x000004c2,0x00000001,0x00050051,0x00000006,0x00000372,
+    0x000004c2,0x00000002,0x00050051,0x00000006,0x00000374,0x000004cb,0x00000000,0x00050051,
+    0x00000006,0x00000376,0x000004cb,0x00000001,0x00050051,0x00000006,0x00000378,0x000004cb,
+    0x00000002,0x00050051,0x00000006,0x0000037a,0x000004d4,0x00000000,0x00050051,0x00000006,
+    0x0000037c,0x000004d4,0x00000001,0x00050051,0x00000006,0x0000037e,0x000004d4,0x00000002,
+    0x00050051,0x00000006,0x00000380,0x000004dd,0x00000000,0x00050051,0x00000006,0x00000382,
+    0x000004dd,0x00000001,0x00050051,0x00000006,0x00000384,0x000004dd,0x00000002,0x0007000c,
+    0x00000006,0x0000055a,0x00000001,0x00000025,0x0000036e,0x0000037a,0x0007000c,0x00000006,
+    0x0000055b,0x00000001,0x00000025,0x00000368,0x0000055a,0x0007000c,0x00000006,0x00000404,
+    0x00000001,0x00000025,0x0000055b,0x00000380,0x0007000c,0x00000006,0x00000561,0x00000001,
+    0x00000025,0x00000370,0x0000037c,0x0007000c,0x00000006,0x00000562,0x00000001,0x00000025,
+    0x0000036a,0x00000561,0x0007000c,0x00000006,0x0000040a,0x00000001,0x00000025,0x00000562,
+    0x00000382,0x0007000c,0x00000006,0x00000568,0x00000001,0x00000025,0x00000372,0x0000037e,
+    0x0007000c,0x00000006,0x00000569,0x00000001,0x00000025,0x0000036c,0x00000568,0x0007000c,
+    0x00000006,0x00000410,0x00000001,0x00000025,0x00000569,0x00000384,0x0007000c,0x00000006,
+    0x0000056f,0x00000001,0x00000028,0x0000036e,0x0000037a,0x0007000c,0x00000006,0x00000570,
+    0x00000001,0x00000028,0x00000368,0x0000056f,0x0007000c,0x00000006,0x00000416,0x00000001,
+    0x00000028,0x00000570,0x00000380,0x0007000c,0x00000006,0x00000576,0x00000001,0x00000028,
+    0x00000370,0x0000037c,0x0007000c,0x00000006,0x00000577,0x00000001,0x00000028,0x0000036a,
+    0x00000576,0x0007000c,0x00000006,0x0000041c,0x00000001,0x00000028,0x00000577,0x00000382,
+    0x0007000c,0x00000006,0x0000057d,0x00000001,0x00000028,0x00000372,0x0000037e,0x0007000c,
+    0x00000006,0x0000057e,0x00000001,0x00000028,0x0000036c,0x0000057d,0x0007000c,0x00000006,
+    0x00000422,0x00000001,0x00000028,0x0000057e,0x00000384,0x00050088,0x00000006,0x00000587,
+    0x00000154,0x00000416,0x00050085,0x00000006,0x00000428,0x00000404,0x00000587,0x00050088,
+    0x00000006,0x00000593,0x00000154,0x0000041c,0x00050085,0x00000006,0x0000042e,0x0000040a,
+    0x00000593,0x00050088,0x00000006,0x0000059f,0x00000154,0x00000422,0x00050085,0x00000006,
+    0x00000434,0x00000410,0x0000059f,0x00050083,0x00000006,0x00000438,0x00000054,0x00000416,
+    0x00050085,0x00000006,0x0000043b,0x000001d7,0x00000404,0x00050081,0x00000006,0x0000043e,
+    0x0000043b,0x000001d3,0x00050088,0x00000006,0x000005ab,0x00000054,0x0000043e,0x00050085,
+    0x00000006,0x00000440,0x00000438,0x000005ab,0x00050083,0x00000006,0x00000444,0x00000054,
+    0x0000041c,0x00050085,0x00000006,0x00000447,0x000001d7,0x0000040a,0x00050081,0x00000006,
+    0x0000044a,0x00000447,0x000001d3,0x00050088,0x00000006,0x000005b7,0x00000054,0x0000044a,
+    0x00050085,0x00000006,0x0000044c,0x00000444,0x000005b7,0x00050083,0x00000006,0x00000450,
+    0x00000054,0x00000422,0x00050085,0x00000006,0x00000453,0x000001d7,0x00000410,0x00050081,
+    0x00000006,0x00000456,0x00000453,0x000001d3,0x00050088,0x00000006,0x000005c3,0x00000054,
+    0x00000456,0x00050085,0x00000006,0x00000458,0x00000450,0x000005c3,0x0004007f,0x00000006,
+    0x0000045a,0x00000428,0x0007000c,0x00000006,0x0000045c,0x00000001,0x00000028,0x0000045a,
+    0x00000440,0x0004007f,0x00000006,0x0000045e,0x0000042e,0x0007000c,0x00000006,0x00000460,
+    0x00000001,0x00000028,0x0000045e,0x0000044c,0x0004007f,0x00000006,0x00000462,0x00000434,
+    0x0007000c,0x00000006,0x00000464,0x00000001,0x00000028,0x00000462,0x00000458,0x0007000c,
+    0x00000006,0x000005cf,0x00000001,0x00000028,0x00000460,0x00000464,0x0007000c,0x00000006,
+    0x000005d0,0x00000001,0x00000028,0x0000045c,0x000005cf,0x0007000c,0x00000006,0x0000046b,
+    0x00000001,0x00000025,0x000005d0,0x0000005c,0x0007000c,0x00000006,0x0000046c,0x00000001,
+    0x00000028,0x0000022e,0x0000046b,0x00050051,0x0000000c,0x0000046e,0x000002b5,0x00000000,
+    0x0004007c,0x00000006,0x0000046f,0x0000046e,0x00050085,0x00000006,0x00000470,0x0000046c,
+    0x0000046f,0x00050085,0x00000006,0x00000473,0x000001d7,0x00000470,0x00050081,0x00000006,
+    0x00000475,0x00000473,0x00000054,0x0004007c,0x0000000c,0x000005e1,0x00000475,0x00050082,
+    0x0000000c,0x000005e2,0x00000065,0x000005e1,0x0004007c,0x00000006,0x000005e3,0x000005e2,
+    0x0004007f,0x00000006,0x000005e6,0x000005e3,0x00050085,0x00000006,0x000005e8,0x000005e6,
+    0x00000475,0x00050081,0x00000006,0x000005ea,0x000005e8,0x00000071,0x00050085,0x00000006,
+    0x000005eb,0x000005e3,0x000005ea,0x00050081,0x00000006,0x00000611,0x00000368,0x0000036e,
+    0x00050081,0x00000006,0x00000612,0x00000611,0x00000380,0x00050081,0x00000006,0x00000613,
+    0x00000612,0x0000037a,0x00050085,0x00000006,0x00000485,0x00000470,0x00000613,0x00050081,
+    0x00000006,0x00000487,0x00000485,0x00000374,0x00050085,0x00000006,0x00000489,0x00000487,
+    0x000005eb,0x00050081,0x00000006,0x00000614,0x0000036a,0x00000370,0x00050081,0x00000006,
+    0x00000615,0x00000614,0x00000382,0x00050081,0x00000006,0x00000616,0x00000615,0x0000037c,
+    0x00050085,0x00000006,0x00000498,0x00000470,0x00000616,0x00050081,0x00000006,0x0000049a,
+    0x00000498,0x00000376,0x00050085,0x00000006,0x0000049c,0x0000049a,0x000005eb,0x00050081,
+    0x00000006,0x00000617,0x0000036c,0x00000372,0x00050081,0x00000006,0x00000618,0x00000617,
+    0x00000384,0x00050081,0x00000006,0x00000619,0x00000618,0x0000037e,0x00050085,0x00000006,
+    0x000004ab,0x00000470,0x00000619,0x00050081,0x00000006,0x000004ad,0x000004ab,0x00000378,
+    0x00050085,0x00000006,0x000004af,0x000004ad,0x000005eb,0x00060052,0x00000090,0x00000609,
+    0x00000489,0x0000061d,0x00000000,0x00060052,0x00000090,0x0000060b,0x0000049c,0x00000609,
+    0x00000001,0x00060052,0x00000090,0x0000060d,0x000004af,0x0000060b,0x00000002,0x000200f9,
+    0x000002a0,0x000200f8,0x000002a0,0x000700f5,0x00000090,0x0000061c,0x000002a2,0x0000029f,
+    0x0000060d,0x000002a3,0x0004003d,0x000002be,0x000002c1,0x000002c0,0x0004007c,0x00000027,
+    0x000002c4,0x00000289,0x00050051,0x00000006,0x000002c6,0x0000061c,0x00000000,0x00050051,
+    0x00000006,0x000002c7,0x0000061c,0x00000001,0x00050051,0x00000006,0x000002c8,0x0000061c,
+    0x00000002,0x00070050,0x00000029,0x000002c9,0x000002c6,0x000002c7,0x000002c8,0x00000054,
+    0x00040063,0x000002c1,0x000002c4,0x000002c9,0x000100fd,0x00010038
+};
+
+static void destroy_pipeline(VkDevice device, struct fs_comp_pipeline *pipeline)
+{
+    device->funcs.p_vkDestroyPipeline(device->device, pipeline->pipeline, NULL);
+    pipeline->pipeline = VK_NULL_HANDLE;
+
+    device->funcs.p_vkDestroyPipelineLayout(device->device, pipeline->pipeline_layout, NULL);
+    pipeline->pipeline_layout = VK_NULL_HANDLE;
+}
+
+static VkResult create_pipeline(VkDevice device, struct VkSwapchainKHR_T *swapchain,
+    const uint32_t *code, uint32_t code_size, uint32_t push_size, struct fs_comp_pipeline *pipeline)
+{
 #if defined(USE_STRUCT_CONVERSION)
     VkComputePipelineCreateInfo_host pipelineInfo = {0};
 #else
     VkComputePipelineCreateInfo pipelineInfo = {0};
 #endif
+    VkPipelineLayoutCreateInfo pipelineLayoutInfo = {0};
+    VkShaderModuleCreateInfo shaderInfo = {0};
+    VkPushConstantRange pushConstants;
+    VkShaderModule shaderModule = 0;
+    VkResult res;
+
+    pipeline->push_size = push_size;
+
+    pushConstants.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+    pushConstants.offset = 0;
+    pushConstants.size = push_size;
+
+    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
+    pipelineLayoutInfo.setLayoutCount = 1;
+    pipelineLayoutInfo.pSetLayouts = &swapchain->descriptor_set_layout;
+    pipelineLayoutInfo.pushConstantRangeCount = 1;
+    pipelineLayoutInfo.pPushConstantRanges = &pushConstants;
+
+    res = device->funcs.p_vkCreatePipelineLayout(device->device, &pipelineLayoutInfo, NULL, &pipeline->pipeline_layout);
+    if(res != VK_SUCCESS)
+    {
+        ERR("vkCreatePipelineLayout: %d\n", res);
+        goto fail;
+    }
+
+    shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
+    shaderInfo.codeSize = code_size;
+    shaderInfo.pCode = code;
+
+    res = device->funcs.p_vkCreateShaderModule(device->device, &shaderInfo, NULL, &shaderModule);
+    if(res != VK_SUCCESS)
+    {
+        ERR("vkCreateShaderModule: %d\n", res);
+        goto fail;
+    }
 
     pipelineInfo.sType = VK_STRUCTURE_TYPE_COMPUTE_PIPELINE_CREATE_INFO;
     pipelineInfo.stage.sType = VK_STRUCTURE_TYPE_PIPELINE_SHADER_STAGE_CREATE_INFO;
     pipelineInfo.stage.stage = VK_SHADER_STAGE_COMPUTE_BIT;
     pipelineInfo.stage.module = shaderModule;
     pipelineInfo.stage.pName = "main";
-    pipelineInfo.layout = swapchain->pipeline_layout;
+    pipelineInfo.layout = pipeline->pipeline_layout;
     pipelineInfo.basePipelineHandle = VK_NULL_HANDLE;
     pipelineInfo.basePipelineIndex = -1;
 
-    res = device->funcs.p_vkCreateComputePipelines(device->device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &swapchain->pipeline);
-    if(res != VK_SUCCESS){
-        ERR("vkCreateComputePipelines: %d\n", res);
-        return res;
-    }
+    res = device->funcs.p_vkCreateComputePipelines(device->device, VK_NULL_HANDLE, 1, &pipelineInfo, NULL, &pipeline->pipeline);
+    if(res == VK_SUCCESS)
+        goto out;
 
-    return VK_SUCCESS;
+    ERR("vkCreateComputePipelines: %d\n", res);
+
+fail:
+    destroy_pipeline(device, pipeline);
+
+out:
+    device->funcs.p_vkDestroyShaderModule(device->device, shaderModule, NULL);
+
+    return res;
 }
 
 static VkResult create_descriptor_set(VkDevice device, struct VkSwapchainKHR_T *swapchain, struct fs_hack_image *hack)
@@ -1911,7 +2888,8 @@ static VkResult create_descriptor_set(VkDevice device, struct VkSwapchainKHR_T *
     descriptorAllocInfo.pSetLayouts = &swapchain->descriptor_set_layout;
 
     res = device->funcs.p_vkAllocateDescriptorSets(device->device, &descriptorAllocInfo, &hack->descriptor_set);
-    if(res != VK_SUCCESS){
+    if (res != VK_SUCCESS)
+    {
         ERR("vkAllocateDescriptorSets: %d\n", res);
         return res;
     }
@@ -1921,7 +2899,7 @@ static VkResult create_descriptor_set(VkDevice device, struct VkSwapchainKHR_T *
     userDescriptorImageInfo.sampler = swapchain->sampler;
 
     realDescriptorImageInfo.imageLayout = VK_IMAGE_LAYOUT_GENERAL;
-    realDescriptorImageInfo.imageView = hack->blit_view;
+    realDescriptorImageInfo.imageView = swapchain->fsr ? hack->fsr_view : hack->swapchain_view;
 
     descriptorWrites[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
     descriptorWrites[0].dstSet = hack->descriptor_set;
@@ -1941,10 +2919,47 @@ static VkResult create_descriptor_set(VkDevice device, struct VkSwapchainKHR_T *
 
     device->funcs.p_vkUpdateDescriptorSets(device->device, 2, descriptorWrites, 0, NULL);
 
+    if (swapchain->fsr)
+    {
+        res = device->funcs.p_vkAllocateDescriptorSets(device->device, &descriptorAllocInfo, &hack->fsr_set);
+        if (res != VK_SUCCESS)
+        {
+            ERR("vkAllocateDescriptorSets: %d\n", res);
+            return res;
+        }
+
+        userDescriptorImageInfo.imageView = hack->fsr_view;
+
+        realDescriptorImageInfo.imageView = hack->swapchain_view;
+
+        descriptorWrites[0].dstSet = hack->fsr_set;
+        descriptorWrites[1].dstSet = hack->fsr_set;
+
+        device->funcs.p_vkUpdateDescriptorSets(device->device, 2, descriptorWrites, 0, NULL);
+    }
+
     return VK_SUCCESS;
 }
 
-static VkResult init_blit_images(VkDevice device, struct VkSwapchainKHR_T *swapchain)
+static VkFormat srgb_to_unorm(VkFormat format)
+{
+    switch (format)
+    {
+        case VK_FORMAT_R8G8B8A8_SRGB: return VK_FORMAT_R8G8B8A8_UNORM;
+        case VK_FORMAT_B8G8R8A8_SRGB: return VK_FORMAT_B8G8R8A8_UNORM;
+        case VK_FORMAT_R8G8B8_SRGB: return VK_FORMAT_R8G8B8_UNORM;
+        case VK_FORMAT_B8G8R8_SRGB: return VK_FORMAT_B8G8R8_UNORM;
+        case VK_FORMAT_A8B8G8R8_SRGB_PACK32: return VK_FORMAT_A8B8G8R8_UNORM_PACK32;
+        default: return format;
+    }
+}
+
+static BOOL is_srgb(VkFormat format)
+{
+    return format != srgb_to_unorm(format);
+}
+
+static VkResult init_compute_state(VkDevice device, struct VkSwapchainKHR_T *swapchain)
 {
     VkResult res;
     VkSamplerCreateInfo samplerInfo = {0};
@@ -1952,31 +2967,27 @@ static VkResult init_blit_images(VkDevice device, struct VkSwapchainKHR_T *swapc
     VkDescriptorPoolCreateInfo poolInfo = {0};
     VkDescriptorSetLayoutBinding layoutBindings[2] = {{0}, {0}};
     VkDescriptorSetLayoutCreateInfo descriptorLayoutInfo = {0};
-    VkPipelineLayoutCreateInfo pipelineLayoutInfo = {0};
-    VkPushConstantRange pushConstants;
-    VkShaderModuleCreateInfo shaderInfo = {0};
-    VkShaderModule shaderModule = 0;
-    VkDeviceSize blitMemTotal = 0, offs;
+    VkDeviceSize fsrMemTotal = 0, offs;
     VkImageCreateInfo imageInfo = {0};
 #if defined(USE_STRUCT_CONVERSION)
-    VkMemoryRequirements_host blitMemReq;
+    VkMemoryRequirements_host fsrMemReq;
     VkMemoryAllocateInfo_host allocInfo = {0};
     VkPhysicalDeviceMemoryProperties_host memProperties;
     VkImageViewCreateInfo_host viewInfo = {0};
 #else
-    VkMemoryRequirements blitMemReq;
+    VkMemoryRequirements fsrMemReq;
     VkMemoryAllocateInfo allocInfo = {0};
     VkPhysicalDeviceMemoryProperties memProperties;
     VkImageViewCreateInfo viewInfo = {0};
 #endif
-    uint32_t blit_memory_type = -1, i;
+    uint32_t fsr_memory_type = -1, i;
 
     samplerInfo.sType = VK_STRUCTURE_TYPE_SAMPLER_CREATE_INFO;
     samplerInfo.magFilter = swapchain->fs_hack_filter;
     samplerInfo.minFilter = swapchain->fs_hack_filter;
-    samplerInfo.addressModeU = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-    samplerInfo.addressModeV = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
-    samplerInfo.addressModeW = VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeU = swapchain->fsr ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeV = swapchain->fsr ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
+    samplerInfo.addressModeW = swapchain->fsr ? VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_EDGE : VK_SAMPLER_ADDRESS_MODE_CLAMP_TO_BORDER;
     samplerInfo.anisotropyEnable = VK_FALSE;
     samplerInfo.maxAnisotropy = 1;
     samplerInfo.borderColor = VK_BORDER_COLOR_INT_OPAQUE_BLACK;
@@ -1989,7 +3000,7 @@ static VkResult init_blit_images(VkDevice device, struct VkSwapchainKHR_T *swapc
     samplerInfo.maxLod = 0.0f;
 
     res = device->funcs.p_vkCreateSampler(device->device, &samplerInfo, NULL, &swapchain->sampler);
-    if(res != VK_SUCCESS)
+    if (res != VK_SUCCESS)
     {
         WARN("vkCreateSampler failed, res=%d\n", res);
         return res;
@@ -2005,8 +3016,16 @@ static VkResult init_blit_images(VkDevice device, struct VkSwapchainKHR_T *swapc
     poolInfo.pPoolSizes = poolSizes;
     poolInfo.maxSets = swapchain->n_images;
 
+    if (swapchain->fsr)
+    {
+        poolSizes[0].descriptorCount *= 2;
+        poolSizes[1].descriptorCount *= 2;
+        poolInfo.maxSets *= 2;
+    }
+
     res = device->funcs.p_vkCreateDescriptorPool(device->device, &poolInfo, NULL, &swapchain->descriptor_pool);
-    if(res != VK_SUCCESS){
+    if (res != VK_SUCCESS)
+    {
         ERR("vkCreateDescriptorPool: %d\n", res);
         goto fail;
     }
@@ -2028,142 +3047,154 @@ static VkResult init_blit_images(VkDevice device, struct VkSwapchainKHR_T *swapc
     descriptorLayoutInfo.pBindings = layoutBindings;
 
     res = device->funcs.p_vkCreateDescriptorSetLayout(device->device, &descriptorLayoutInfo, NULL, &swapchain->descriptor_set_layout);
-    if(res != VK_SUCCESS){
+    if (res != VK_SUCCESS)
+    {
         ERR("vkCreateDescriptorSetLayout: %d\n", res);
         goto fail;
     }
 
-    pushConstants.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
-    pushConstants.offset = 0;
-    pushConstants.size = 4 * sizeof(float); /* 2 * vec2 */
-
-    pipelineLayoutInfo.sType = VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO;
-    pipelineLayoutInfo.setLayoutCount = 1;
-    pipelineLayoutInfo.pSetLayouts = &swapchain->descriptor_set_layout;
-    pipelineLayoutInfo.pushConstantRangeCount = 1;
-    pipelineLayoutInfo.pPushConstantRanges = &pushConstants;
-
-    res = device->funcs.p_vkCreatePipelineLayout(device->device, &pipelineLayoutInfo, NULL, &swapchain->pipeline_layout);
-    if(res != VK_SUCCESS){
-        ERR("vkCreatePipelineLayout: %d\n", res);
-        goto fail;
-    }
-
-    shaderInfo.sType = VK_STRUCTURE_TYPE_SHADER_MODULE_CREATE_INFO;
-    shaderInfo.codeSize = sizeof(blit_comp_spv);
-    shaderInfo.pCode = blit_comp_spv;
-
-    res = device->funcs.p_vkCreateShaderModule(device->device, &shaderInfo, NULL, &shaderModule);
-    if(res != VK_SUCCESS){
-        ERR("vkCreateShaderModule: %d\n", res);
-        goto fail;
-    }
-
-    res = create_pipeline(device, swapchain, shaderModule);
+    res = create_pipeline(device, swapchain, blit_comp_spv, sizeof(blit_comp_spv), 4 * sizeof(float) /* 2 * vec2 */, &swapchain->blit_pipeline);
     if(res != VK_SUCCESS)
         goto fail;
 
-    device->funcs.p_vkDestroyShaderModule(device->device, shaderModule, NULL);
+    if (swapchain->fsr)
+    {
+        res = create_pipeline(device, swapchain, fsr_easu_comp_spv, sizeof(fsr_easu_comp_spv), 16 * sizeof(uint32_t) /* 4 * uvec4 */, &swapchain->fsr_easu_pipeline);
+        if (res != VK_SUCCESS)
+            goto fail;
+        res = create_pipeline(device, swapchain, fsr_rcas_comp_spv, sizeof(fsr_rcas_comp_spv), 8 * sizeof(uint32_t) /* uvec4 + ivec4 */, &swapchain->fsr_rcas_pipeline);
+        if (res != VK_SUCCESS)
+            goto fail;
 
-    if(!(swapchain->surface_usage & VK_IMAGE_USAGE_STORAGE_BIT)){
-        TRACE("using intermediate blit images\n");
-        /* create intermediate blit images */
-        for(i = 0; i < swapchain->n_images; ++i){
+        /* create intermediate fsr images */
+        for (i = 0; i < swapchain->n_images; ++i)
+        {
             struct fs_hack_image *hack = &swapchain->fs_hack_images[i];
 
             imageInfo.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
             imageInfo.imageType = VK_IMAGE_TYPE_2D;
-            imageInfo.extent.width = swapchain->real_extent.width;
-            imageInfo.extent.height = swapchain->real_extent.height;
+            imageInfo.extent.width = swapchain->blit_dst.extent.width;
+            imageInfo.extent.height = swapchain->blit_dst.extent.height;
             imageInfo.extent.depth = 1;
             imageInfo.mipLevels = 1;
             imageInfo.arrayLayers = 1;
-            imageInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+            imageInfo.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
             imageInfo.tiling = VK_IMAGE_TILING_OPTIMAL;
             imageInfo.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-            imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_TRANSFER_SRC_BIT;
+            imageInfo.usage = VK_IMAGE_USAGE_STORAGE_BIT | VK_IMAGE_USAGE_SAMPLED_BIT;
             imageInfo.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
             imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
-            res = device->funcs.p_vkCreateImage(device->device, &imageInfo, NULL, &hack->blit_image);
-            if(res != VK_SUCCESS){
+            res = device->funcs.p_vkCreateImage(device->device, &imageInfo, NULL, &hack->fsr_image);
+            if (res != VK_SUCCESS)
+            {
                 ERR("vkCreateImage failed: %d\n", res);
                 goto fail;
             }
 
-            device->funcs.p_vkGetImageMemoryRequirements(device->device, hack->blit_image, &blitMemReq);
+            device->funcs.p_vkGetImageMemoryRequirements(device->device, hack->fsr_image, &fsrMemReq);
 
-            offs = blitMemTotal % blitMemReq.alignment;
+            offs = fsrMemTotal % fsrMemReq.alignment;
             if(offs)
-                blitMemTotal += blitMemReq.alignment - offs;
+                fsrMemTotal += fsrMemReq.alignment - offs;
 
-            blitMemTotal += blitMemReq.size;
+            fsrMemTotal += fsrMemReq.size;
         }
 
         /* allocate backing memory */
         device->phys_dev->instance->funcs.p_vkGetPhysicalDeviceMemoryProperties(device->phys_dev->phys_dev, &memProperties);
 
-        for(i = 0; i < memProperties.memoryTypeCount; i++){
-            if((memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT){
-                if(blitMemReq.memoryTypeBits & (1 << i)){
-                    blit_memory_type = i;
+        for (i = 0; i < memProperties.memoryTypeCount; i++)
+        {
+            if ((memProperties.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT) == VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)
+            {
+                if (fsrMemReq.memoryTypeBits & (1 << i))
+                {
+                    fsr_memory_type = i;
                     break;
                 }
             }
         }
 
-        if(blit_memory_type == -1){
+        if (fsr_memory_type == -1)
+        {
             ERR("unable to find suitable memory type\n");
             res = VK_ERROR_OUT_OF_HOST_MEMORY;
             goto fail;
         }
 
         allocInfo.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
-        allocInfo.allocationSize = blitMemTotal;
-        allocInfo.memoryTypeIndex = blit_memory_type;
+        allocInfo.allocationSize = fsrMemTotal;
+        allocInfo.memoryTypeIndex = fsr_memory_type;
 
-        res = device->funcs.p_vkAllocateMemory(device->device, &allocInfo, NULL, &swapchain->blit_image_memory);
-        if(res != VK_SUCCESS){
+        res = device->funcs.p_vkAllocateMemory(device->device, &allocInfo, NULL, &swapchain->fsr_image_memory);
+        if (res != VK_SUCCESS)
+        {
             ERR("vkAllocateMemory: %d\n", res);
             goto fail;
         }
 
         /* bind backing memory and create imageviews */
-        blitMemTotal = 0;
-        for(i = 0; i < swapchain->n_images; ++i){
+        fsrMemTotal = 0;
+        for (i = 0; i < swapchain->n_images; ++i)
+        {
             struct fs_hack_image *hack = &swapchain->fs_hack_images[i];
 
-            device->funcs.p_vkGetImageMemoryRequirements(device->device, hack->blit_image, &blitMemReq);
+            device->funcs.p_vkGetImageMemoryRequirements(device->device, hack->fsr_image, &fsrMemReq);
 
-            offs = blitMemTotal % blitMemReq.alignment;
+            offs = fsrMemTotal % fsrMemReq.alignment;
             if(offs)
-                blitMemTotal += blitMemReq.alignment - offs;
+                fsrMemTotal += fsrMemReq.alignment - offs;
 
-            res = device->funcs.p_vkBindImageMemory(device->device, hack->blit_image, swapchain->blit_image_memory, blitMemTotal);
-            if(res != VK_SUCCESS){
+            res = device->funcs.p_vkBindImageMemory(device->device, hack->fsr_image, swapchain->fsr_image_memory, fsrMemTotal);
+            if(res != VK_SUCCESS)
+            {
                 ERR("vkBindImageMemory: %d\n", res);
                 goto fail;
             }
 
-            blitMemTotal += blitMemReq.size;
+            fsrMemTotal += fsrMemReq.size;
         }
-    }else
-        TRACE("blitting directly to swapchain images\n");
+
+        /* create imageviews */
+        for (i = 0; i < swapchain->n_images; ++i)
+        {
+            struct fs_hack_image *hack = &swapchain->fs_hack_images[i];
+
+            viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
+            viewInfo.image = hack->fsr_image;
+            viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
+            viewInfo.format = VK_FORMAT_A2B10G10R10_UNORM_PACK32;
+            viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+            viewInfo.subresourceRange.baseMipLevel = 0;
+            viewInfo.subresourceRange.levelCount = 1;
+            viewInfo.subresourceRange.baseArrayLayer = 0;
+            viewInfo.subresourceRange.layerCount = 1;
+
+            res = device->funcs.p_vkCreateImageView(device->device, &viewInfo, NULL, &hack->fsr_view);
+            if(res != VK_SUCCESS)
+            {
+                ERR("vkCreateImageView(blit): %d\n", res);
+                goto fail;
+            }
+        }
+    }
+
 
     /* create imageviews */
     for(i = 0; i < swapchain->n_images; ++i){
         struct fs_hack_image *hack = &swapchain->fs_hack_images[i];
 
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
-        viewInfo.image = hack->blit_image ? hack->blit_image : hack->swapchain_image;
+        viewInfo.image = hack->swapchain_image;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = VK_FORMAT_R8G8B8A8_UNORM;
+        viewInfo.format = srgb_to_unorm(swapchain->format);
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         viewInfo.subresourceRange.baseMipLevel = 0;
         viewInfo.subresourceRange.levelCount = 1;
         viewInfo.subresourceRange.baseArrayLayer = 0;
         viewInfo.subresourceRange.layerCount = 1;
 
-        res = device->funcs.p_vkCreateImageView(device->device, &viewInfo, NULL, &hack->blit_view);
+        res = device->funcs.p_vkCreateImageView(device->device, &viewInfo, NULL, &hack->swapchain_view);
         if(res != VK_SUCCESS){
             ERR("vkCreateImageView(blit): %d\n", res);
             goto fail;
@@ -2180,20 +3211,19 @@ fail:
     for(i = 0; i < swapchain->n_images; ++i){
         struct fs_hack_image *hack = &swapchain->fs_hack_images[i];
 
-        device->funcs.p_vkDestroyImageView(device->device, hack->blit_view, NULL);
-        hack->blit_view = VK_NULL_HANDLE;
+        device->funcs.p_vkDestroyImageView(device->device, hack->fsr_view, NULL);
+        hack->fsr_view = VK_NULL_HANDLE;
 
-        device->funcs.p_vkDestroyImage(device->device, hack->blit_image, NULL);
-        hack->blit_image = VK_NULL_HANDLE;
+        device->funcs.p_vkDestroyImageView(device->device, hack->swapchain_view, NULL);
+        hack->swapchain_view = VK_NULL_HANDLE;
+
+        device->funcs.p_vkDestroyImage(device->device, hack->fsr_image, NULL);
+        hack->fsr_image = VK_NULL_HANDLE;
     }
 
-    device->funcs.p_vkDestroyShaderModule(device->device, shaderModule, NULL);
-
-    device->funcs.p_vkDestroyPipeline(device->device, swapchain->pipeline, NULL);
-    swapchain->pipeline = VK_NULL_HANDLE;
-
-    device->funcs.p_vkDestroyPipelineLayout(device->device, swapchain->pipeline_layout, NULL);
-    swapchain->pipeline_layout = VK_NULL_HANDLE;
+    destroy_pipeline(device, &swapchain->blit_pipeline);
+    destroy_pipeline(device, &swapchain->fsr_easu_pipeline);
+    destroy_pipeline(device, &swapchain->fsr_rcas_pipeline);
 
     device->funcs.p_vkDestroyDescriptorSetLayout(device->device, swapchain->descriptor_set_layout, NULL);
     swapchain->descriptor_set_layout = VK_NULL_HANDLE;
@@ -2201,8 +3231,8 @@ fail:
     device->funcs.p_vkDestroyDescriptorPool(device->device, swapchain->descriptor_pool, NULL);
     swapchain->descriptor_pool = VK_NULL_HANDLE;
 
-    device->funcs.p_vkFreeMemory(device->device, swapchain->blit_image_memory, NULL);
-    swapchain->blit_image_memory = VK_NULL_HANDLE;
+    device->funcs.p_vkFreeMemory(device->device, swapchain->fsr_image_memory, NULL);
+    swapchain->fsr_image_memory = VK_NULL_HANDLE;
 
     device->funcs.p_vkDestroySampler(device->device, swapchain->sampler, NULL);
     swapchain->sampler = VK_NULL_HANDLE;
@@ -2213,9 +3243,10 @@ fail:
 static void destroy_fs_hack_image(VkDevice device, struct VkSwapchainKHR_T *swapchain, struct fs_hack_image *hack)
 {
     device->funcs.p_vkDestroyImageView(device->device, hack->user_view, NULL);
-    device->funcs.p_vkDestroyImageView(device->device, hack->blit_view, NULL);
+    device->funcs.p_vkDestroyImageView(device->device, hack->swapchain_view, NULL);
+    device->funcs.p_vkDestroyImageView(device->device, hack->fsr_view, NULL);
     device->funcs.p_vkDestroyImage(device->device, hack->user_image, NULL);
-    device->funcs.p_vkDestroyImage(device->device, hack->blit_image, NULL);
+    device->funcs.p_vkDestroyImage(device->device, hack->fsr_image, NULL);
     if(hack->cmd)
         device->funcs.p_vkFreeCommandBuffers(device->device,
                 swapchain->cmd_pools[hack->cmd_queue_idx],
@@ -2296,6 +3327,13 @@ static VkResult init_fs_hack_images(VkDevice device, struct VkSwapchainKHR_T *sw
         imageInfo.samples = VK_SAMPLE_COUNT_1_BIT;
         imageInfo.queueFamilyIndexCount = createinfo->queueFamilyIndexCount;
         imageInfo.pQueueFamilyIndices = createinfo->pQueueFamilyIndices;
+
+        if (is_srgb(createinfo->imageFormat))
+            imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT;
+
+        if (createinfo->flags & VK_SWAPCHAIN_CREATE_MUTABLE_FORMAT_BIT_KHR)
+            imageInfo.flags = VK_IMAGE_CREATE_MUTABLE_FORMAT_BIT | VK_IMAGE_CREATE_EXTENDED_USAGE_BIT;
+
         res = device->funcs.p_vkCreateImage(device->device, &imageInfo, NULL, &hack->user_image);
         if(res != VK_SUCCESS){
             ERR("vkCreateImage failed: %d\n", res);
@@ -2361,7 +3399,7 @@ static VkResult init_fs_hack_images(VkDevice device, struct VkSwapchainKHR_T *sw
         viewInfo.sType = VK_STRUCTURE_TYPE_IMAGE_VIEW_CREATE_INFO;
         viewInfo.image = swapchain->fs_hack_images[i].user_image;
         viewInfo.viewType = VK_IMAGE_VIEW_TYPE_2D;
-        viewInfo.format = createinfo->imageFormat;
+        viewInfo.format = srgb_to_unorm(createinfo->imageFormat);
         viewInfo.subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
         viewInfo.subresourceRange.baseMipLevel = 0;
         viewInfo.subresourceRange.levelCount = 1;
@@ -2446,7 +3484,7 @@ NTSTATUS wine_vkCreateSwapchainKHR(void *args)
         native_info.oldSwapchain = ((struct VkSwapchainKHR_T *)(UINT_PTR)native_info.oldSwapchain)->swapchain;
 
     if(vk_funcs->query_fs_hack &&
-            vk_funcs->query_fs_hack(native_info.surface, &object->real_extent, &user_sz, &object->blit_dst, &object->fs_hack_filter) &&
+            vk_funcs->query_fs_hack(native_info.surface, &object->real_extent, &user_sz, &object->blit_dst, &object->fs_hack_filter, &object->fsr, &object->sharpness) &&
             native_info.imageExtent.width == user_sz.width &&
             native_info.imageExtent.height == user_sz.height)
     {
@@ -2471,7 +3509,12 @@ NTSTATUS wine_vkCreateSwapchainKHR(void *args)
         TRACE("surface usage flags: 0x%x\n", object->surface_usage);
 
         native_info.imageExtent = object->real_extent;
-        native_info.imageUsage |= VK_IMAGE_USAGE_TRANSFER_DST_BIT; /* XXX: check if supported by surface */
+        native_info.imageUsage = VK_IMAGE_USAGE_TRANSFER_DST_BIT | VK_IMAGE_USAGE_STORAGE_BIT; /* XXX: check if supported by surface */
+
+        object->format = native_info.imageFormat;
+
+        if (object->fsr)
+            native_info.imageFormat = srgb_to_unorm(native_info.imageFormat);
 
         if(native_info.imageFormat != VK_FORMAT_B8G8R8A8_UNORM &&
                 native_info.imageFormat != VK_FORMAT_B8G8R8A8_SRGB){
@@ -2503,9 +3546,7 @@ NTSTATUS wine_vkCreateSwapchainKHR(void *args)
             return result;
         }
 
-        /* FIXME: would be nice to do this on-demand, but games can use up all
-         * memory so we fail to allocate later */
-        result = init_blit_images(device, object);
+        result = init_compute_state(device, object);
         if(result != VK_SUCCESS){
             ERR("creating blit images failed: %d\n", result);
             device->funcs.p_vkDestroySwapchainKHR(device->device, object->swapchain, NULL);
@@ -2609,7 +3650,7 @@ NTSTATUS wine_vkGetPhysicalDeviceSurfaceCapabilitiesKHR(void *args)
         adjust_max_image_count(phys_dev, capabilities);
 
     if (res == VK_SUCCESS && vk_funcs->query_fs_hack &&
-            vk_funcs->query_fs_hack(wine_surface_from_handle(surface)->driver_surface, NULL, &user_res, NULL, NULL)){
+            vk_funcs->query_fs_hack(wine_surface_from_handle(surface)->driver_surface, NULL, &user_res, NULL, NULL, NULL, NULL)){
         capabilities->currentExtent = user_res;
         capabilities->minImageExtent = user_res;
         capabilities->maxImageExtent = user_res;
@@ -2635,7 +3676,7 @@ NTSTATUS wine_vkGetPhysicalDeviceSurfaceCapabilities2KHR(void *args)
         adjust_max_image_count(phys_dev, &capabilities->surfaceCapabilities);
 
     if (res == VK_SUCCESS && vk_funcs->query_fs_hack &&
-            vk_funcs->query_fs_hack(wine_surface_from_handle(surface_info->surface)->driver_surface, NULL, &user_res, NULL, NULL)){
+            vk_funcs->query_fs_hack(wine_surface_from_handle(surface_info->surface)->driver_surface, NULL, &user_res, NULL, NULL, NULL, NULL)){
         capabilities->surfaceCapabilities.currentExtent = user_res;
         capabilities->surfaceCapabilities.minImageExtent = user_res;
         capabilities->surfaceCapabilities.maxImageExtent = user_res;
@@ -2820,13 +3861,14 @@ NTSTATUS wine_vkDestroySwapchainKHR(void *args)
             if(object->cmd_pools[i])
                 device->funcs.p_vkDestroyCommandPool(device->device, object->cmd_pools[i], NULL);
 
-        device->funcs.p_vkDestroyPipeline(device->device, object->pipeline, NULL);
-        device->funcs.p_vkDestroyPipelineLayout(device->device, object->pipeline_layout, NULL);
+        destroy_pipeline(device, &object->blit_pipeline);
+        destroy_pipeline(device, &object->fsr_easu_pipeline);
+        destroy_pipeline(device, &object->fsr_rcas_pipeline);
         device->funcs.p_vkDestroyDescriptorSetLayout(device->device, object->descriptor_set_layout, NULL);
         device->funcs.p_vkDestroyDescriptorPool(device->device, object->descriptor_pool, NULL);
         device->funcs.p_vkDestroySampler(device->device, object->sampler, NULL);
         device->funcs.p_vkFreeMemory(device->device, object->user_image_memory, NULL);
-        device->funcs.p_vkFreeMemory(device->device, object->blit_image_memory, NULL);
+        device->funcs.p_vkFreeMemory(device->device, object->fsr_image_memory, NULL);
         free(object->cmd_pools);
         free(object->fs_hack_images);
     }
@@ -2898,29 +3940,54 @@ static VkCommandBuffer create_hack_cmd(VkQueue queue, struct VkSwapchainKHR_T *s
     return cmd;
 }
 
+static void bind_pipeline(VkDevice device, VkCommandBuffer cmd, struct fs_comp_pipeline *pipeline, VkDescriptorSet set, void *push_data)
+{
+    device->funcs.p_vkCmdBindPipeline(cmd,
+            VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline);
+
+    device->funcs.p_vkCmdBindDescriptorSets(cmd,
+            VK_PIPELINE_BIND_POINT_COMPUTE, pipeline->pipeline_layout,
+            0, 1, &set, 0, NULL);
+
+    device->funcs.p_vkCmdPushConstants(cmd,
+            pipeline->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
+            0, pipeline->push_size, push_data);
+}
+
+#if defined(USE_STRUCT_CONVERSION)
+static void init_barrier(VkImageMemoryBarrier_host *barrier)
+#else
+static void init_barrier(VkImageMemoryBarrier *barrier)
+#endif
+{
+    barrier->sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    barrier->pNext = NULL;
+    barrier->srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier->dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
+    barrier->subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+    barrier->subresourceRange.baseMipLevel = 0;
+    barrier->subresourceRange.levelCount = 1;
+    barrier->subresourceRange.baseArrayLayer = 0;
+    barrier->subresourceRange.layerCount = 1;
+}
+
+
 static VkResult record_compute_cmd(VkDevice device, struct VkSwapchainKHR_T *swapchain, struct fs_hack_image *hack)
 {
-    VkResult result;
-    VkImageCopy region = {0};
 #if defined(USE_STRUCT_CONVERSION)
-    VkImageMemoryBarrier_host barriers[3] = {{0}};
+    VkImageMemoryBarrier_host barriers[2] = {{0}};
     VkCommandBufferBeginInfo_host beginInfo = {0};
 #else
-    VkImageMemoryBarrier barriers[3] = {{0}};
+    VkImageMemoryBarrier barriers[2] = {{0}};
     VkCommandBufferBeginInfo beginInfo = {0};
 #endif
     float constants[4];
+    VkResult result;
 
     TRACE("recording compute command\n");
 
-#if 0
-    /* DOOM runs out of memory when allocating blit images after loading. */
-    if(!swapchain->blit_image_memory){
-        result = init_blit_images(device, swapchain);
-        if(result != VK_SUCCESS)
-            return result;
-    }
-#endif
+    init_barrier(&barriers[0]);
+    init_barrier(&barriers[1]);
 
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
@@ -2929,35 +3996,19 @@ static VkResult record_compute_cmd(VkDevice device, struct VkSwapchainKHR_T *swa
 
     /* for the cs we run... */
     /* transition user image from PRESENT_SRC to SHADER_READ */
-    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
-    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barriers[0].image = hack->user_image;
-    barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barriers[0].subresourceRange.baseMipLevel = 0;
-    barriers[0].subresourceRange.levelCount = 1;
-    barriers[0].subresourceRange.baseArrayLayer = 0;
-    barriers[0].subresourceRange.layerCount = 1;
     barriers[0].srcAccessMask = 0;
     barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
 
     /* storage image... */
-    /* transition blit image from whatever to GENERAL */
-    barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
+    /* transition swapchain image from whatever to GENERAL */
     barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-    barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[1].image = hack->blit_image ? hack->blit_image : hack->swapchain_image;
-    barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barriers[1].subresourceRange.baseMipLevel = 0;
-    barriers[1].subresourceRange.levelCount = 1;
-    barriers[1].subresourceRange.baseArrayLayer = 0;
-    barriers[1].subresourceRange.layerCount = 1;
+    barriers[1].image = hack->swapchain_image;
     barriers[1].srcAccessMask = 0;
-    barriers[1].dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barriers[1].dstAccessMask = 0;
 
     device->funcs.p_vkCmdPipelineBarrier(
             hack->cmd,
@@ -2970,12 +4021,6 @@ static VkResult record_compute_cmd(VkDevice device, struct VkSwapchainKHR_T *swa
     );
 
     /* perform blit shader */
-    device->funcs.p_vkCmdBindPipeline(hack->cmd,
-            VK_PIPELINE_BIND_POINT_COMPUTE, swapchain->pipeline);
-
-    device->funcs.p_vkCmdBindDescriptorSets(hack->cmd,
-            VK_PIPELINE_BIND_POINT_COMPUTE, swapchain->pipeline_layout,
-            0, 1, &hack->descriptor_set, 0, NULL);
 
     /* vec2: blit dst offset in real coords */
     constants[0] = swapchain->blit_dst.offset.x;
@@ -2983,28 +4028,26 @@ static VkResult record_compute_cmd(VkDevice device, struct VkSwapchainKHR_T *swa
     /* vec2: blit dst extents in real coords */
     constants[2] = swapchain->blit_dst.extent.width;
     constants[3] = swapchain->blit_dst.extent.height;
-    device->funcs.p_vkCmdPushConstants(hack->cmd,
-            swapchain->pipeline_layout, VK_SHADER_STAGE_COMPUTE_BIT,
-            0, sizeof(constants), constants);
+
+    bind_pipeline(device, hack->cmd, &swapchain->blit_pipeline, hack->descriptor_set, constants);
 
     /* local sizes in shader are 8 */
     device->funcs.p_vkCmdDispatch(hack->cmd, ceil(swapchain->real_extent.width / 8.),
             ceil(swapchain->real_extent.height / 8.), 1);
 
     /* transition user image from SHADER_READ back to PRESENT_SRC */
-    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
     barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barriers[0].image = hack->user_image;
-    barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barriers[0].subresourceRange.baseMipLevel = 0;
-    barriers[0].subresourceRange.levelCount = 1;
-    barriers[0].subresourceRange.baseArrayLayer = 0;
-    barriers[0].subresourceRange.layerCount = 1;
-    barriers[0].srcAccessMask = VK_ACCESS_SHADER_READ_BIT;
+    barriers[0].srcAccessMask = 0;
     barriers[0].dstAccessMask = 0;
+
+    /* transition swapchain image from GENERAL to PRESENT_SRC */
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barriers[1].image = hack->swapchain_image;
+    barriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barriers[1].dstAccessMask = 0;
 
     device->funcs.p_vkCmdPipelineBarrier(
             hack->cmd,
@@ -3013,123 +4056,9 @@ static VkResult record_compute_cmd(VkDevice device, struct VkSwapchainKHR_T *swa
             0,
             0, NULL,
             0, NULL,
-            1, barriers
+            2, barriers
     );
 
-    if(hack->blit_image){
-        /* for the copy... */
-        /* no transition, just a barrier for our access masks (w -> r) */
-        barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        barriers[0].newLayout = VK_IMAGE_LAYOUT_GENERAL;
-        barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barriers[0].image = hack->blit_image;
-        barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barriers[0].subresourceRange.baseMipLevel = 0;
-        barriers[0].subresourceRange.levelCount = 1;
-        barriers[0].subresourceRange.baseArrayLayer = 0;
-        barriers[0].subresourceRange.layerCount = 1;
-        barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
-
-        /* for the copy... */
-        /* transition swapchain image from whatever to TRANSFER_DST
-         * we don't care about the contents... */
-        barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
-        barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barriers[1].image = hack->swapchain_image;
-        barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barriers[1].subresourceRange.baseMipLevel = 0;
-        barriers[1].subresourceRange.levelCount = 1;
-        barriers[1].subresourceRange.baseArrayLayer = 0;
-        barriers[1].subresourceRange.layerCount = 1;
-        barriers[1].srcAccessMask = 0;
-        barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-
-        device->funcs.p_vkCmdPipelineBarrier(
-                hack->cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0,
-                0, NULL,
-                0, NULL,
-                2, barriers
-        );
-
-        /* copy from blit image to swapchain image */
-        region.srcSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.srcSubresource.layerCount = 1;
-        region.srcOffset.x = 0;
-        region.srcOffset.y = 0;
-        region.srcOffset.z = 0;
-        region.dstSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        region.dstSubresource.layerCount = 1;
-        region.dstOffset.x = 0;
-        region.dstOffset.y = 0;
-        region.dstOffset.z = 0;
-        region.extent.width = swapchain->real_extent.width;
-        region.extent.height = swapchain->real_extent.height;
-        region.extent.depth = 1;
-
-        device->funcs.p_vkCmdCopyImage(hack->cmd,
-                hack->blit_image, VK_IMAGE_LAYOUT_GENERAL,
-                hack->swapchain_image, VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL,
-                1, &region);
-
-        /* transition swapchain image from TRANSFER_DST_OPTIMAL to PRESENT_SRC */
-        barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-        barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barriers[0].image = hack->swapchain_image;
-        barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barriers[0].subresourceRange.baseMipLevel = 0;
-        barriers[0].subresourceRange.levelCount = 1;
-        barriers[0].subresourceRange.baseArrayLayer = 0;
-        barriers[0].subresourceRange.layerCount = 1;
-        barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
-        barriers[0].dstAccessMask = 0;
-
-        device->funcs.p_vkCmdPipelineBarrier(
-                hack->cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_TRANSFER_BIT,
-                0,
-                0, NULL,
-                0, NULL,
-                1, barriers
-        );
-    }else{
-        /* transition swapchain image from GENERAL to PRESENT_SRC */
-        barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
-        barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
-        barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-        barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-        barriers[0].image = hack->swapchain_image;
-        barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-        barriers[0].subresourceRange.baseMipLevel = 0;
-        barriers[0].subresourceRange.levelCount = 1;
-        barriers[0].subresourceRange.baseArrayLayer = 0;
-        barriers[0].subresourceRange.layerCount = 1;
-        barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
-        barriers[0].dstAccessMask = 0;
-
-        device->funcs.p_vkCmdPipelineBarrier(
-                hack->cmd,
-                VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
-                VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                0,
-                0, NULL,
-                0, NULL,
-                1, barriers
-        );
-    }
 
     result = device->funcs.p_vkEndCommandBuffer(hack->cmd);
     if(result != VK_SUCCESS){
@@ -3156,38 +4085,25 @@ static VkResult record_graphics_cmd(VkDevice device, struct VkSwapchainKHR_T *sw
 
     TRACE("recording graphics command\n");
 
+    init_barrier(&barriers[0]);
+    init_barrier(&barriers[1]);
+
     beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
 
     device->funcs.p_vkBeginCommandBuffer(hack->cmd, &beginInfo);
 
     /* transition real image from whatever to TRANSFER_DST_OPTIMAL */
-    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barriers[0].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
     barriers[0].newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
-    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barriers[0].image = hack->swapchain_image;
-    barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barriers[0].subresourceRange.baseMipLevel = 0;
-    barriers[0].subresourceRange.levelCount = 1;
-    barriers[0].subresourceRange.baseArrayLayer = 0;
-    barriers[0].subresourceRange.layerCount = 1;
     barriers[0].srcAccessMask = 0;
-    barriers[0].dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    barriers[0].dstAccessMask = 0;
 
     /* transition user image from PRESENT_SRC to TRANSFER_SRC_OPTIMAL */
-    barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barriers[1].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
     barriers[1].newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
-    barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barriers[1].image = hack->user_image;
-    barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barriers[1].subresourceRange.baseMipLevel = 0;
-    barriers[1].subresourceRange.levelCount = 1;
-    barriers[1].subresourceRange.baseArrayLayer = 0;
-    barriers[1].subresourceRange.layerCount = 1;
     barriers[1].srcAccessMask = 0;
     barriers[1].dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
 
@@ -3237,33 +4153,17 @@ static VkResult record_graphics_cmd(VkDevice device, struct VkSwapchainKHR_T *sw
             1, &blitregion, swapchain->fs_hack_filter);
 
     /* transition real image from TRANSFER_DST to PRESENT_SRC */
-    barriers[0].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barriers[0].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
     barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    barriers[0].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[0].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barriers[0].image = hack->swapchain_image;
-    barriers[0].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barriers[0].subresourceRange.baseMipLevel = 0;
-    barriers[0].subresourceRange.levelCount = 1;
-    barriers[0].subresourceRange.baseArrayLayer = 0;
-    barriers[0].subresourceRange.layerCount = 1;
     barriers[0].srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
     barriers[0].dstAccessMask = 0;
 
     /* transition user image from TRANSFER_SRC_OPTIMAL to back to PRESENT_SRC */
-    barriers[1].sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
     barriers[1].oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
     barriers[1].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
-    barriers[1].srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
-    barriers[1].dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
     barriers[1].image = hack->user_image;
-    barriers[1].subresourceRange.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
-    barriers[1].subresourceRange.baseMipLevel = 0;
-    barriers[1].subresourceRange.levelCount = 1;
-    barriers[1].subresourceRange.baseArrayLayer = 0;
-    barriers[1].subresourceRange.layerCount = 1;
-    barriers[1].srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+    barriers[1].srcAccessMask = 0;
     barriers[1].dstAccessMask = 0;
 
     device->funcs.p_vkCmdPipelineBarrier(
@@ -3285,14 +4185,179 @@ static VkResult record_graphics_cmd(VkDevice device, struct VkSwapchainKHR_T *sw
     return VK_SUCCESS;
 }
 
-NTSTATUS wine_vkQueuePresentKHR(void *args)
+static VkResult record_fsr_cmd(VkDevice device, struct VkSwapchainKHR_T *swapchain, struct fs_hack_image *hack)
 {
-    struct vkQueuePresentKHR_params *params = args;
-    VkQueue queue = params->queue;
-    const VkPresentInfoKHR *pPresentInfo = params->pPresentInfo;
+#if defined(USE_STRUCT_CONVERSION)
+    VkImageMemoryBarrier_host barriers[3] = {{0}};
+    VkCommandBufferBeginInfo_host beginInfo = {0};
+#else
+    VkImageMemoryBarrier barriers[3] = {{0}};
+    VkCommandBufferBeginInfo beginInfo = {0};
+#endif
+    union
+    {
+        uint32_t uint[16];
+        float    fp[16];
+    } c;
+    VkResult result;
+
+    TRACE("recording compute command\n");
+
+    init_barrier(&barriers[0]);
+    init_barrier(&barriers[1]);
+    init_barrier(&barriers[2]);
+
+    beginInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_SIMULTANEOUS_USE_BIT;
+
+    device->funcs.p_vkBeginCommandBuffer(hack->cmd, &beginInfo);
+
+    /* 1st pass (easu) */
+    /* transition user image from PRESENT_SRC to SHADER_READ */
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[0].image = hack->user_image;
+    barriers[0].srcAccessMask = 0;
+    barriers[0].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    /* storage image... */
+    /* transition fsr image from whatever to GENERAL */
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barriers[1].image = hack->swapchain_image;
+    barriers[1].srcAccessMask = 0;
+    barriers[1].dstAccessMask = 0;
+
+    device->funcs.p_vkCmdPipelineBarrier(
+            hack->cmd,
+            VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            0,
+            0, NULL,
+            0, NULL,
+            2, barriers
+    );
+
+    /* perform easu shader */
+
+    c.fp[0] = swapchain->user_extent.width * (1.0f / swapchain->blit_dst.extent.width);
+    c.fp[1] = swapchain->user_extent.height * (1.0f / swapchain->blit_dst.extent.height);
+    c.fp[2] = 0.5f * c.fp[0] - 0.5f;
+    c.fp[3] = 0.5f * c.fp[1] - 0.5f;
+    // Viewport pixel position to normalized image space.
+    // This is used to get upper-left of 'F' tap.
+    c.fp[4] = 1.0f / swapchain->user_extent.width;
+    c.fp[5] = 1.0f / swapchain->user_extent.height;
+    // Centers of gather4, first offset from upper-left of 'F'.
+    //      +---+---+
+    //      |   |   |
+    //      +--(0)--+
+    //      | b | c |
+    //  +---F---+---+---+
+    //  | e | f | g | h |
+    //  +--(1)--+--(2)--+
+    //  | i | j | k | l |
+    //  +---+---+---+---+
+    //      | n | o |
+    //      +--(3)--+
+    //      |   |   |
+    //      +---+---+
+    c.fp[6] =  1.0f * c.fp[4];
+    c.fp[7] = -1.0f * c.fp[5];
+    // These are from (0) instead of 'F'.
+    c.fp[8] = -1.0f * c.fp[4];
+    c.fp[9] =  2.0f * c.fp[5];
+    c.fp[10] =  1.0f * c.fp[4];
+    c.fp[11] =  2.0f * c.fp[5];
+    c.fp[12] =  0.0f * c.fp[4];
+    c.fp[13] =  4.0f * c.fp[5];
+    c.uint[14] = swapchain->blit_dst.extent.width;
+    c.uint[15] = swapchain->blit_dst.extent.height;
+
+    bind_pipeline(device, hack->cmd, &swapchain->fsr_easu_pipeline, hack->descriptor_set, c.uint);
+
+    /* local sizes in shader are 8 */
+    device->funcs.p_vkCmdDispatch(hack->cmd, ceil(swapchain->blit_dst.extent.width / 8.),
+            ceil(swapchain->blit_dst.extent.height / 8.), 1);
+
+    /* transition user image from SHADER_READ back to PRESENT_SRC */
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
+    barriers[0].image = hack->user_image;
+    barriers[0].srcAccessMask = 0;
+    barriers[0].dstAccessMask = 0;
+
+    /* transition fsr image from GENERAL to SHADER_READ */
+    barriers[1].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barriers[1].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[1].image = hack->swapchain_image;
+    barriers[1].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barriers[1].dstAccessMask = VK_ACCESS_SHADER_READ_BIT;
+
+    /* transition swapchain image from whatever to GENERAL */
+    barriers[2].oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
+    barriers[2].newLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barriers[2].image = hack->swapchain_image;
+    barriers[2].srcAccessMask = 0;
+    barriers[2].dstAccessMask = 0;
+
+    device->funcs.p_vkCmdPipelineBarrier(
+            hack->cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0,
+            0, NULL,
+            0, NULL,
+            3, barriers
+    );
+
+    /* 2nd pass (rcas) */
+
+    c.fp[0] = exp2f(-swapchain->sharpness);
+    c.uint[2] = swapchain->blit_dst.extent.width;
+    c.uint[3] = swapchain->blit_dst.extent.height;
+    c.uint[4] = swapchain->blit_dst.offset.x;
+    c.uint[5] = swapchain->blit_dst.offset.y;
+    c.uint[6] = swapchain->blit_dst.offset.x + swapchain->blit_dst.extent.width;
+    c.uint[7] = swapchain->blit_dst.offset.y + swapchain->blit_dst.extent.height;
+
+    bind_pipeline(device, hack->cmd, &swapchain->fsr_rcas_pipeline, hack->fsr_set, c.uint);
+
+    /* local sizes in shader are 8 */
+    device->funcs.p_vkCmdDispatch(hack->cmd, ceil(swapchain->real_extent.width / 8.),
+            ceil(swapchain->real_extent.height / 8.), 1);
+
+    /* transition swapchain image from GENERAL to PRESENT_SRC */
+    barriers[0].oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+    barriers[0].newLayout = VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL;
+    barriers[0].image = hack->swapchain_image;
+    barriers[0].srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+    barriers[0].dstAccessMask = 0;
+
+    device->funcs.p_vkCmdPipelineBarrier(
+            hack->cmd,
+            VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+            VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+            0,
+            0, NULL,
+            0, NULL,
+            1, barriers
+    );
+
+    result = device->funcs.p_vkEndCommandBuffer(hack->cmd);
+    if (result != VK_SUCCESS)
+    {
+        ERR("vkEndCommandBuffer: %d\n", result);
+        return result;
+    }
+
+    return VK_SUCCESS;
+}
+
+static VkResult fshack_vk_queue_present(VkQueue queue, const VkPresentInfoKHR *pPresentInfo)
+{
     VkResult res;
     VkPresentInfoKHR our_presentInfo;
-    VkSwapchainKHR *arr;
     VkCommandBuffer *blit_cmds = NULL;
     VkSubmitInfo submitInfo = {0};
     VkSemaphore blit_sema;
@@ -3330,13 +4395,27 @@ NTSTATUS wine_vkQueuePresentKHR(void *args)
                     return VK_ERROR_DEVICE_LOST;
                 }
 
-                if(queue->device->queue_props[queue_idx].queueFlags & VK_QUEUE_GRAPHICS_BIT)
-                    res = record_graphics_cmd(queue->device, swapchain, hack);
-                else if(queue->device->queue_props[queue_idx].queueFlags & VK_QUEUE_COMPUTE_BIT)
-                    res = record_compute_cmd(queue->device, swapchain, hack);
-                else{
-                    ERR("Present queue is neither graphics nor compute queue!\n");
-                    res = VK_ERROR_DEVICE_LOST;
+                if (swapchain->fsr)
+                {
+                    if(queue->device->queue_props[queue_idx].queueFlags & VK_QUEUE_COMPUTE_BIT)
+                        res = record_fsr_cmd(queue->device, swapchain, hack);
+                    else
+                    {
+                        ERR("Present queue is not a compute queue!\n");
+                        res = VK_ERROR_DEVICE_LOST;
+                    }
+                }
+                else
+                {
+                    if(queue->device->queue_props[queue_idx].queueFlags & VK_QUEUE_GRAPHICS_BIT)
+                        res = record_graphics_cmd(queue->device, swapchain, hack);
+                    if(queue->device->queue_props[queue_idx].queueFlags & VK_QUEUE_COMPUTE_BIT && !is_srgb(swapchain->format))
+                        res = record_compute_cmd(queue->device, swapchain, hack);
+                    else
+                    {
+                        ERR("Present queue is neither graphics nor compute queue with unorm format!\n");
+                        res = VK_ERROR_DEVICE_LOST;
+                    }
                 }
 
                 if(res != VK_SUCCESS){
@@ -3378,7 +4457,7 @@ NTSTATUS wine_vkQueuePresentKHR(void *args)
         submitInfo.signalSemaphoreCount = 1;
         submitInfo.pSignalSemaphores = &blit_sema;
 
-        res = queue->device->funcs.p_vkQueueSubmit(queue->queue, 1, &submitInfo, VK_NULL_HANDLE);
+        res = thunk_vkQueueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
         if(res != VK_SUCCESS)
             ERR("vkQueueSubmit: %d\n", res);
 
@@ -3389,22 +4468,7 @@ NTSTATUS wine_vkQueuePresentKHR(void *args)
         our_presentInfo.pWaitSemaphores = &blit_sema;
     }
 
-    arr = malloc(our_presentInfo.swapchainCount * sizeof(VkSwapchainKHR));
-    if(!arr){
-        ERR("Failed to allocate memory for swapchain array\n");
-        return VK_ERROR_OUT_OF_HOST_MEMORY;
-    }
-
-    for(i = 0; i < our_presentInfo.swapchainCount; ++i)
-        arr[i] = ((struct VkSwapchainKHR_T *)(UINT_PTR)our_presentInfo.pSwapchains[i])->swapchain;
-
-    our_presentInfo.pSwapchains = arr;
-
-    res = queue->device->funcs.p_vkQueuePresentKHR(queue->queue, &our_presentInfo);
-
-    free(arr);
-
-    return res;
+    return thunk_vkQueuePresentKHR(queue, &our_presentInfo);
 }
 
 static void fixup_pipeline_feedback(VkPipelineCreationFeedback *feedback, uint32_t count)
@@ -3523,6 +4587,10 @@ BOOL WINAPI wine_vk_is_available_device_function(VkDevice device, const char *na
 {
     if (!strcmp(name, "vkGetMemoryWin32HandleKHR") || !strcmp(name, "vkGetMemoryWin32HandlePropertiesKHR"))
         name = "vkGetMemoryFdKHR";
+    if (!strcmp(name, "vkGetSemaphoreWin32HandleKHR"))
+        name = "vkGetSemaphoreFdKHR";
+    if (!strcmp(name, "vkImportSemaphoreWin32HandleKHR"))
+        name = "vkImportSemaphoreFdKHR";
     return !!vk_funcs->p_vkGetDeviceProcAddr(device->device, name);
 }
 
@@ -4025,4 +5093,1775 @@ NTSTATUS wine_vkCreateImage(void *args)
     free_VkImageCreateInfo_struct_chain(&create_info_host);
 
     return res;
+}
+
+#define IOCTL_SHARED_GPU_RESOURCE_SET_OBJECT           CTL_CODE(FILE_DEVICE_VIDEO, 6, METHOD_BUFFERED, FILE_WRITE_ACCESS)
+
+static bool set_shared_resource_object(HANDLE shared_resource, unsigned int index, HANDLE handle)
+{
+    IO_STATUS_BLOCK iosb;
+    struct shared_resource_set_object
+    {
+        unsigned int index;
+        obj_handle_t handle;
+    } params;
+
+    params.index = index;
+    params.handle = wine_server_obj_handle(handle);
+
+    return NtDeviceIoControlFile(shared_resource, NULL, NULL, NULL, &iosb, IOCTL_SHARED_GPU_RESOURCE_SET_OBJECT,
+            &params, sizeof(params), NULL, 0) == STATUS_SUCCESS;
+}
+
+#define IOCTL_SHARED_GPU_RESOURCE_GET_OBJECT           CTL_CODE(FILE_DEVICE_VIDEO, 6, METHOD_BUFFERED, FILE_READ_ACCESS)
+
+static HANDLE get_shared_resource_object(HANDLE shared_resource, unsigned int index)
+{
+    IO_STATUS_BLOCK iosb;
+    obj_handle_t handle;
+
+    if (NtDeviceIoControlFile(shared_resource, NULL, NULL, NULL, &iosb, IOCTL_SHARED_GPU_RESOURCE_GET_OBJECT,
+            &index, sizeof(index), &handle, sizeof(handle)))
+        return NULL;
+
+    return wine_server_ptr_handle(handle);
+}
+
+static void d3d12_semaphore_lock(struct wine_semaphore *semaphore)
+{
+    assert( semaphore->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT );
+    pthread_mutex_lock(&semaphore->d3d12_fence_shm->mutex);
+}
+
+static void d3d12_semaphore_unlock(struct wine_semaphore *semaphore)
+{
+    assert( semaphore->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT );
+    pthread_mutex_unlock(&semaphore->d3d12_fence_shm->mutex);
+}
+
+/* returns -1 when there is no queued update that would satisfy the wait */
+static uint64_t d3d12_semaphore_try_get_wait_value_locked(struct wine_semaphore *semaphore, uint64_t virtual_value,
+        struct VkQueue_T *waiting_queue)
+{
+    struct pending_update *update;
+    uint64_t ret = -1;
+    unsigned int i;
+
+    if (semaphore->d3d12_fence_shm->virtual_value >= virtual_value)
+        return 0;
+
+    for (i = 0; i < semaphore->d3d12_fence_shm->pending_updates_count; i++)
+    {
+        update = &semaphore->d3d12_fence_shm->pending_updates[i];
+
+        if (update->virtual_value < virtual_value)
+            continue;
+
+        if (update->signalling_pid == getpid() && waiting_queue && update->signalling_queue == waiting_queue)
+            return 0;
+
+        ret = min(ret, update->physical_value);
+    }
+
+    return ret;
+}
+
+static struct pending_wait *d3d12_semaphore_push_wait_locked(struct wine_semaphore *semaphore, uint64_t virtual_value)
+{
+    struct pending_wait *wait;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(semaphore->d3d12_fence_shm->pending_waits); i++)
+    {
+        wait = &semaphore->d3d12_fence_shm->pending_waits[i];
+        if (!wait->present)
+            break;
+    }
+
+    if (i == ARRAY_SIZE(semaphore->d3d12_fence_shm->pending_waits))
+    {
+        FIXME("Failed to wait on semaphore %p, maximum waits exceeded.\n", semaphore);
+        return NULL;
+    }
+
+    wait->present = true;
+    wait->satisfied = false;
+    wait->virtual_value = virtual_value;
+    wait->physical_value = 0;
+
+    return wait;
+}
+
+static uint64_t d3d12_semaphore_pop_wait_locked(struct wine_semaphore *semaphore, struct pending_wait *wait)
+{
+    wait->satisfied = false;
+    wait->present = false;
+
+    return wait->physical_value;
+}
+
+static void d3d12_semaphore_satisfy_waits_locked(struct wine_semaphore *semaphore, uint64_t virtual_value,
+        uint64_t physical_value)
+{
+    struct pending_wait *wait;
+    unsigned int i;
+
+    for (i = 0; i < ARRAY_SIZE(semaphore->d3d12_fence_shm->pending_waits); i++)
+    {
+        wait = &semaphore->d3d12_fence_shm->pending_waits[i];
+
+        if (wait->present && !wait->satisfied && wait->virtual_value <= virtual_value)
+        {
+            wait->satisfied = true;
+            wait->physical_value = physical_value;
+            pthread_cond_signal(&wait->cond);
+        }
+    }
+}
+
+static uint64_t d3d12_semaphore_add_pending_signal_locked(struct wine_semaphore *semaphore, uint64_t virtual_value,
+        struct VkQueue_T *signalling_queue)
+{
+    struct pending_update *update;
+
+    if (semaphore->d3d12_fence_shm->pending_updates_count == ARRAY_SIZE(semaphore->d3d12_fence_shm->pending_updates))
+    {
+        FIXME("Failed to queue signal on d3d12 semaphore, maximum concurrent signals exceeded.\n");
+        return 0;
+    }
+
+    update = &semaphore->d3d12_fence_shm->pending_updates[
+        semaphore->d3d12_fence_shm->pending_updates_count++];
+
+    update->virtual_value = virtual_value;
+    update->physical_value = ++semaphore->d3d12_fence_shm->counter;
+    update->signalling_pid = getpid();
+    update->signalling_queue = signalling_queue;
+
+    return update->physical_value;
+}
+
+static struct pending_update d3d12_semaphore_peek_added_signal_locked(struct wine_semaphore *semaphore)
+{
+    return semaphore->d3d12_fence_shm->pending_updates[semaphore->d3d12_fence_shm->pending_updates_count - 1];
+}
+
+static bool d3d12_semaphore_pop_pending_signal_locked(struct wine_semaphore *semaphore, uint64_t phys_val, struct pending_update *ret)
+{
+    struct pending_update *update;
+    unsigned int i;
+
+    for (i = 0; i < semaphore->d3d12_fence_shm->pending_updates_count; i++)
+    {
+        if (semaphore->d3d12_fence_shm->pending_updates[i].physical_value == phys_val)
+        {
+            update = &semaphore->d3d12_fence_shm->pending_updates[i];
+            if (ret)
+                *ret = *update;
+            *update = semaphore->d3d12_fence_shm->pending_updates[--semaphore->d3d12_fence_shm->pending_updates_count];
+            return true;
+        }
+    }
+
+    return false;
+}
+
+static void d3d12_semaphore_update_phys_val_locked(struct wine_semaphore *sem, uint64_t phys_val)
+{
+    struct pending_update pending;
+
+    /* Based off linked VKD3D-Proton implementation, but we don't signal CPU waits here.
+        * https://github.com/HansKristian-Work/vkd3d-proton/blob/829ac72e3d381006a843c183e613e8ee77e0b292/libs/vkd3d/command.c#L758 */
+    while (sem->d3d12_fence_shm->physical_value < phys_val)
+    {
+        sem->d3d12_fence_shm->physical_value++;
+
+        if (d3d12_semaphore_pop_pending_signal_locked(sem, sem->d3d12_fence_shm->physical_value, &pending))
+            sem->d3d12_fence_shm->virtual_value = pending.virtual_value;
+    }
+}
+
+NTSTATUS wine_vkCreateSemaphore(void *args)
+{
+    struct vkCreateSemaphore_params *params = args;
+    VkDevice device = params->device;
+    const VkSemaphoreCreateInfo *create_info = params->pCreateInfo;
+    const VkAllocationCallbacks *allocator = params->pAllocator;
+    VkSemaphore *semaphore = params->pSemaphore;
+
+    VkExportSemaphoreWin32HandleInfoKHR *export_handle_info = wine_vk_find_struct(create_info, EXPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR);
+    VkSemaphoreCreateInfo create_info_host = *create_info;
+    VkExportSemaphoreCreateInfo *export_semaphore_info;
+    VkSemaphoreGetFdInfoKHR_host fd_info;
+    pthread_mutexattr_t mutex_attr;
+    struct wine_semaphore *object;
+    pthread_condattr_t cond_attr;
+    OBJECT_ATTRIBUTES attr;
+    HANDLE section_handle;
+    LARGE_INTEGER li;
+    unsigned int i;
+    VkResult res;
+    SIZE_T size;
+    int fd;
+
+    TRACE("(%p, %p, %p, %p)\n", device, create_info, allocator, semaphore);
+
+    if (allocator)
+        FIXME("Support for allocation callbacks not implemented yet\n");
+
+    if ((res = convert_VkSemaphoreCreateInfo_struct_chain(create_info->pNext, &create_info_host)))
+    {
+        WARN("Failed to convert VkSemaphoreCreateInfo pNext chain, res=%d.\n", res);
+        return res;
+    }
+
+    if (!(object = calloc(1, sizeof(*object))))
+    {
+        free_VkSemaphoreCreateInfo_struct_chain(&create_info_host);
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+    }
+
+    object->semaphore = VK_NULL_HANDLE;
+    object->handle = INVALID_HANDLE_VALUE;
+
+    if ((export_semaphore_info = wine_vk_find_struct(&create_info_host, EXPORT_SEMAPHORE_CREATE_INFO)))
+    {
+        object->handle_types = export_semaphore_info->handleTypes;
+        if (export_semaphore_info->handleTypes & (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT | VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT))
+            export_semaphore_info->handleTypes |= VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+        wine_vk_normalize_semaphore_handle_types_host(&export_semaphore_info->handleTypes);
+    }
+
+    if (wine_vk_find_struct(&create_info_host,  EXPORT_SEMAPHORE_WIN32_HANDLE_INFO_KHR))
+        FIXME("VkExportSemaphoreWin32HandleInfoKHR unhandled.\n");
+
+    if ((res = device->funcs.p_vkCreateSemaphore(device->device, &create_info_host, NULL, &object->semaphore)) == VK_SUCCESS)
+    {
+        if (export_semaphore_info && export_semaphore_info->handleTypes == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT)
+        {
+            fd_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR;
+            fd_info.pNext = NULL;
+            fd_info.semaphore = object->semaphore;
+            fd_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+            if ((res = device->funcs.p_vkGetSemaphoreFdKHR(device->device, &fd_info, &fd)) == VK_SUCCESS)
+            {
+                object->handle = create_gpu_resource(fd, export_handle_info ? export_handle_info->name : NULL);
+                close(fd);
+            }
+
+            if (object->handle == INVALID_HANDLE_VALUE)
+            {
+                res = VK_ERROR_OUT_OF_HOST_MEMORY;
+                goto done;
+            }
+
+            if (object->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+            {
+                /* Shared Fence Memory */
+                InitializeObjectAttributes(&attr, NULL, 0, NULL, NULL);
+                size = li.QuadPart = sizeof(*object->d3d12_fence_shm);
+                if (NtCreateSection(&section_handle, STANDARD_RIGHTS_REQUIRED | SECTION_QUERY | SECTION_MAP_READ | SECTION_MAP_WRITE, &attr, &li, PAGE_READWRITE, SEC_COMMIT, NULL))
+                {
+                    res = VK_ERROR_OUT_OF_HOST_MEMORY;
+                    goto done;
+                }
+
+                if (!set_shared_resource_object(object->handle, 0, section_handle))
+                {
+                    NtClose(section_handle);
+                    res = VK_ERROR_OUT_OF_HOST_MEMORY;
+                    goto done;
+                }
+
+                if (NtMapViewOfSection(section_handle, GetCurrentProcess(), (void**) &object->d3d12_fence_shm, 0, 0, NULL, &size, ViewShare, 0, PAGE_READWRITE))
+                {
+                    NtClose(section_handle);
+                    res = VK_ERROR_OUT_OF_HOST_MEMORY;
+                    goto done;
+                }
+
+                NtClose(section_handle);
+
+                pthread_mutexattr_init(&mutex_attr);
+                pthread_mutexattr_setpshared(&mutex_attr, PTHREAD_PROCESS_SHARED);
+                pthread_mutexattr_settype(&mutex_attr, PTHREAD_MUTEX_ERRORCHECK);
+                if (pthread_mutex_init(&object->d3d12_fence_shm->mutex, &mutex_attr))
+                {
+                    pthread_mutexattr_destroy(&mutex_attr);
+                    res = VK_ERROR_OUT_OF_HOST_MEMORY;
+                    goto done;
+                }
+                pthread_mutexattr_destroy(&mutex_attr);
+
+                for (i = 0; i < ARRAY_SIZE(object->d3d12_fence_shm->pending_waits); i++)
+                {
+                    pthread_condattr_init(&cond_attr);
+                    pthread_condattr_setpshared(&cond_attr, PTHREAD_PROCESS_SHARED);
+                    pthread_cond_init(&object->d3d12_fence_shm->pending_waits[i].cond, &cond_attr);
+                    pthread_condattr_destroy(&cond_attr);
+                }
+            }
+        }
+
+        WINE_VK_ADD_NON_DISPATCHABLE_MAPPING(device->phys_dev->instance, object, object->semaphore);
+         *semaphore = wine_semaphore_to_handle(object);
+    }
+
+    done:
+
+    if (res != VK_SUCCESS)
+    {
+        pthread_mutex_destroy(&object->d3d12_fence_shm->mutex);
+        if (object->d3d12_fence_shm)
+            NtUnmapViewOfSection(GetCurrentProcess(), object->d3d12_fence_shm);
+        if (object->handle != INVALID_HANDLE_VALUE)
+            NtClose(object->handle);
+        if (object->semaphore != VK_NULL_HANDLE)
+            device->funcs.p_vkDestroySemaphore(device->device, object->semaphore, NULL);
+        free(object);
+    }
+
+    free_VkSemaphoreCreateInfo_struct_chain(&create_info_host);
+
+    return res;
+}
+
+NTSTATUS wine_vkGetSemaphoreWin32HandleKHR(void *args)
+{
+    struct vkGetSemaphoreWin32HandleKHR_params *params = args;
+    const VkSemaphoreGetWin32HandleInfoKHR *handle_info = params->pGetWin32HandleInfo;
+    HANDLE *handle = params->pHandle;
+
+    struct wine_semaphore *semaphore = wine_semaphore_from_handle(handle_info->semaphore);
+
+    if (!(semaphore->handle_types & handle_info->handleType))
+        return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+    if (NtDuplicateObject( NtCurrentProcess(), semaphore->handle, NtCurrentProcess(), handle, 0, 0, DUPLICATE_SAME_ACCESS ))
+        return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+    return VK_SUCCESS;
+}
+
+NTSTATUS wine_vkDestroySemaphore(void *args)
+{
+    struct vkDestroySemaphore_params *params = args;
+    VkDevice device = params->device;
+    VkSemaphore handle = params->semaphore;
+    const VkAllocationCallbacks *allocator = params->pAllocator;
+
+    struct wine_semaphore *semaphore = wine_semaphore_from_handle(handle);
+
+    TRACE("%p 0x%s, %p\n", device, wine_dbgstr_longlong(handle), allocator);
+
+    if (allocator)
+        FIXME("Support for allocation callbacks not implemented yet\n");
+
+    if (!handle)
+        return VK_SUCCESS;
+
+    if (semaphore->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+    {
+        NtUnmapViewOfSection(GetCurrentProcess(), semaphore->d3d12_fence_shm);
+    }
+
+    if (semaphore->handle_types)
+        NtClose(semaphore->handle);
+
+
+    WINE_VK_REMOVE_HANDLE_MAPPING(device->phys_dev->instance, semaphore);
+    device->funcs.p_vkDestroySemaphore(device->device, semaphore->semaphore, NULL);
+    free(semaphore);
+    return VK_SUCCESS;
+}
+
+NTSTATUS wine_vkImportSemaphoreWin32HandleKHR(void *args)
+{
+    struct vkImportSemaphoreWin32HandleKHR_params *params = args;
+    VkDevice device = params->device;
+    const VkImportSemaphoreWin32HandleInfoKHR *handle_info = params->pImportSemaphoreWin32HandleInfo;
+
+    struct wine_semaphore *semaphore = wine_semaphore_from_handle(handle_info->semaphore);
+    VkImportSemaphoreFdInfoKHR_host fd_info;
+    HANDLE d3d12_fence_shm, sem_handle;
+    NTSTATUS stat;
+    VkResult res;
+    SIZE_T size;
+
+    TRACE("(%p, %p)\n", device, handle_info);
+
+    if (!(semaphore->handle_types & handle_info->handleType))
+        return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+    fd_info.sType = VK_STRUCTURE_TYPE_IMPORT_SEMAPHORE_FD_INFO_KHR;
+    fd_info.pNext = handle_info->pNext;
+    fd_info.semaphore = semaphore->semaphore;
+    fd_info.flags = handle_info->flags;
+    fd_info.handleType = handle_info->handleType;
+
+    if (handle_info->handleType == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_WIN32_BIT ||
+        handle_info->handleType == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+    {
+        if (handle_info->name)
+        {
+            FIXME("Importing win32 semaphore by name not supported.\n");
+            return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        }
+
+        if (NtDuplicateObject( NtCurrentProcess(), handle_info->handle, NtCurrentProcess(), &sem_handle, 0, 0, DUPLICATE_SAME_ACCESS ))
+            return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+
+        fd_info.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+        if ((fd_info.fd = get_shared_resource_fd(sem_handle)) == -1)
+        {
+            WARN("Invalid handle %p.\n", handle_info->handle);
+            NtClose(sem_handle);
+            return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+        }
+
+        if (handle_info->handleType == VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+        {
+            if (handle_info->flags & VK_SEMAPHORE_IMPORT_TEMPORARY_BIT)
+            {
+                FIXME("Temporarily importing d3d12 fences unsupported.\n");
+                close(fd_info.fd);
+                NtClose(sem_handle);
+                return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+            }
+
+            if (!(d3d12_fence_shm = get_shared_resource_object(sem_handle, 0)))
+            {
+                ERR("Failed to get D3D12 semaphore memory.\n");
+                close(fd_info.fd);
+                NtClose(sem_handle);
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+
+            semaphore->d3d12_fence_shm = NULL;
+            size = sizeof(*semaphore->d3d12_fence_shm);
+            if ((stat = NtMapViewOfSection(d3d12_fence_shm, GetCurrentProcess(), (void**) &semaphore->d3d12_fence_shm, 0, 0, NULL, &size, ViewShare, 0, PAGE_READWRITE)))
+            {
+                ERR("Failed to map D3D12 semaphore memory. stat %#x.\n", stat);
+                NtClose(d3d12_fence_shm);
+                close(fd_info.fd);
+                NtClose(sem_handle);
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+
+            NtClose(d3d12_fence_shm);
+        }
+
+        semaphore->current_type = handle_info->handleType;
+        semaphore->handle = sem_handle;
+    }
+
+    wine_vk_normalize_semaphore_handle_types_host(&fd_info.handleType);
+
+    if (!fd_info.handleType)
+    {
+        FIXME("Importing win32 semaphore with handle type %#x not supported.\n", handle_info->handleType);
+        return VK_ERROR_INVALID_EXTERNAL_HANDLE;
+    }
+
+    /* importing FDs transfers ownership, importing NT handles does not  */
+    if ((res = device->funcs.p_vkImportSemaphoreFdKHR(device->device, &fd_info)) != VK_SUCCESS)
+        close(fd_info.fd);
+
+    return res;
+}
+
+
+static NTSTATUS vk_get_semaphore_counter_value(VkDevice device, VkSemaphore semaphore, uint64_t *value, bool khr);
+static NTSTATUS wine_vk_get_semaphore_counter_value(VkDevice device, VkSemaphore handle, uint64_t *value, bool khr)
+{
+    struct wine_semaphore *semaphore = wine_semaphore_from_handle(handle);
+
+    if (semaphore->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+    {
+        d3d12_semaphore_lock(semaphore);
+        *value = semaphore->d3d12_fence_shm->virtual_value;
+        d3d12_semaphore_unlock(semaphore);
+        return VK_SUCCESS;
+    }
+
+    return vk_get_semaphore_counter_value(device, handle, value, khr);
+}
+
+static NTSTATUS vk_get_semaphore_counter_value(VkDevice device, VkSemaphore semaphore, uint64_t *value, bool khr)
+{
+    if (khr)
+        return thunk_vkGetSemaphoreCounterValueKHR(device, semaphore, value);
+    else
+        return thunk_vkGetSemaphoreCounterValue(device, semaphore, value);
+}
+
+NTSTATUS wine_vkGetSemaphoreCounterValue(void *args)
+{
+    struct vkGetSemaphoreCounterValue_params *params = args;
+    VkDevice device = params->device;
+    VkSemaphore semaphore = params->semaphore;
+    uint64_t *value = params->pValue;
+
+    return wine_vk_get_semaphore_counter_value(device, semaphore, value, false);
+}
+
+NTSTATUS wine_vkGetSemaphoreCounterValueKHR(void *args)
+{
+    struct vkGetSemaphoreCounterValue_params *params = args;
+    VkDevice device = params->device;
+    VkSemaphore semaphore = params->semaphore;
+    uint64_t *value = params->pValue;
+
+    return wine_vk_get_semaphore_counter_value(device, semaphore, value, true);
+}
+
+static NTSTATUS vk_signal_semaphore(VkDevice device, const VkSemaphoreSignalInfo *signal_info, bool khr);
+static NTSTATUS wine_vk_signal_semaphore(VkDevice device, const VkSemaphoreSignalInfo *signal_info, bool khr)
+{
+    uint64_t phys_val;
+    VkResult vr;
+
+    struct wine_semaphore *semaphore = wine_semaphore_from_handle(signal_info->semaphore);
+
+    TRACE("(%p, %p)\n", device, signal_info);
+
+    if (semaphore->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+    {
+        d3d12_semaphore_lock(semaphore);
+
+        /* vkWaitSemaphore w/ WAIT_ANY wakes on every physical value increment to check if the wait is satisfied, so
+           if there are no scheduled signals, step the physical value */
+        if ((vr = vk_get_semaphore_counter_value(device, signal_info->semaphore, &phys_val, khr)) != VK_SUCCESS)
+        {
+            d3d12_semaphore_unlock(semaphore);
+            return vr;
+        }
+
+        d3d12_semaphore_update_phys_val_locked(semaphore, phys_val);
+
+        if (!semaphore->d3d12_fence_shm->pending_updates_count)
+        {
+            VkSemaphoreSignalInfo step_signal_info;
+
+            assert(semaphore->d3d12_fence_shm->counter == phys_val);
+            phys_val++;
+
+            semaphore->d3d12_fence_shm->counter = semaphore->d3d12_fence_shm->physical_value = phys_val;
+
+            step_signal_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO;
+            step_signal_info.pNext = NULL;
+            step_signal_info.semaphore = signal_info->semaphore;
+            step_signal_info.value = phys_val;
+
+            vr = vk_signal_semaphore(device, &step_signal_info, khr);
+            if (vr != VK_SUCCESS)
+            {
+                d3d12_semaphore_unlock(semaphore);
+                return vr;
+            }
+        }
+
+        /* If a queue is already waiting on the pending physical value of a previous submit, this won't wake it up. */
+        d3d12_semaphore_satisfy_waits_locked(semaphore, signal_info->value, 0);
+        semaphore->d3d12_fence_shm->virtual_value = signal_info->value;
+
+        d3d12_semaphore_unlock(semaphore);
+        return VK_SUCCESS;
+    }
+
+    return vk_signal_semaphore(device, signal_info, khr);
+}
+
+static NTSTATUS vk_signal_semaphore(VkDevice device, const VkSemaphoreSignalInfo *signal_info, bool khr)
+{
+    if (khr)
+        return thunk_vkSignalSemaphoreKHR(device, signal_info);
+    else
+        return thunk_vkSignalSemaphore(device, signal_info);
+}
+
+NTSTATUS wine_vkSignalSemaphore(void *args)
+{
+    struct vkSignalSemaphore_params *params = args;
+    VkDevice device = params->device;
+    const VkSemaphoreSignalInfo *signal_info = params->pSignalInfo;
+
+    return wine_vk_signal_semaphore(device, signal_info, false);
+}
+
+NTSTATUS wine_vkSignalSemaphoreKHR(void *args)
+{
+    struct vkSignalSemaphore_params *params = args;
+    VkDevice device = params->device;
+    const VkSemaphoreSignalInfo *signal_info = params->pSignalInfo;
+
+    return wine_vk_signal_semaphore(device, signal_info, true);
+}
+
+static NTSTATUS vk_wait_semaphores(VkDevice device, const VkSemaphoreWaitInfo *wait_info, uint64_t timeout, bool khr);
+static NTSTATUS wine_vk_wait_semaphores(VkDevice device, const VkSemaphoreWaitInfo *wait_info, uint64_t timeout, bool khr)
+{
+    VkSemaphoreWaitInfo wait_info_dup = *wait_info;
+    struct timespec abs_timeout, start_time;
+    struct pending_wait **pending_waits;
+    struct pending_wait *pending_wait;
+    unsigned int i, remaining_waits;
+    VkSemaphore* semaphores_dup;
+    uint64_t *values_dup;
+    uint64_t phys_val;
+    int wait_stat;
+    VkResult res;
+
+    TRACE("(%p, %p, 0x%s)\n", device, wait_info, wine_dbgstr_longlong(timeout));
+
+    if (timeout)
+    {
+        clock_gettime(CLOCK_REALTIME, &start_time);
+
+        abs_timeout.tv_sec = start_time.tv_sec + (timeout / NANOSECONDS_IN_A_SECOND);
+        abs_timeout.tv_nsec = start_time.tv_nsec + (timeout % NANOSECONDS_IN_A_SECOND);
+        if (abs_timeout.tv_nsec >= NANOSECONDS_IN_A_SECOND)
+        {
+            abs_timeout.tv_sec++;
+            abs_timeout.tv_nsec-=NANOSECONDS_IN_A_SECOND;
+        }
+    }
+
+    wait_info_dup.pSemaphores = semaphores_dup = calloc(wait_info->semaphoreCount, sizeof(VkSemaphore));
+    wait_info_dup.pValues = values_dup = calloc(wait_info->semaphoreCount, sizeof(uint64_t));
+    pending_waits = calloc(wait_info->semaphoreCount, sizeof(struct pending_wait *));
+
+    for (i = 0; i < wait_info->semaphoreCount; i++)
+    {
+        struct wine_semaphore *semaphore = wine_semaphore_from_handle(wait_info->pSemaphores[i]);
+
+        semaphores_dup[i] = wait_info->pSemaphores[i];
+        values_dup[i] = wait_info->pValues[i];
+
+        if (semaphore->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+        {
+            d3d12_semaphore_lock(semaphore);
+            if ((values_dup[i] = d3d12_semaphore_try_get_wait_value_locked(semaphore, wait_info->pValues[i], NULL)) == -1)
+            {
+                if (!timeout)
+                {
+                    d3d12_semaphore_unlock(semaphore);
+                    continue;
+                }
+
+                pending_wait = d3d12_semaphore_push_wait_locked(semaphore, wait_info->pValues[i]);
+
+                if (wait_info->flags & VK_SEMAPHORE_WAIT_ANY_BIT)
+                {
+                    /* Keep scheduling a wait of current physical_value+1 until the desired virtual value is signaled */
+                    values_dup[i] = semaphore->d3d12_fence_shm->physical_value + 1;
+                    pending_waits[i] = pending_wait;
+                }
+                else
+                {
+                    while (!pending_wait->satisfied && wait_stat != ETIMEDOUT)
+                        wait_stat = pthread_cond_timedwait(&pending_wait->cond, &semaphore->d3d12_fence_shm->mutex, &abs_timeout);
+
+                    values_dup[i] = d3d12_semaphore_pop_wait_locked(semaphore, pending_wait);
+
+                    if (wait_stat == ETIMEDOUT)
+                    {
+                        d3d12_semaphore_unlock(semaphore);
+                        free(semaphores_dup);
+                        free(values_dup);
+                        free(pending_waits);
+                        return VK_TIMEOUT;
+                    }
+                }
+            }
+            d3d12_semaphore_unlock(semaphore);
+        }
+    }
+
+    do
+    {
+        if (timeout)
+        {
+            clock_gettime(CLOCK_REALTIME, &start_time);
+
+            if (start_time.tv_sec > abs_timeout.tv_sec ||
+                    (start_time.tv_sec == abs_timeout.tv_sec && start_time.tv_nsec >= abs_timeout.tv_nsec))
+                timeout = 0;
+            else
+                timeout = ((abs_timeout.tv_sec - start_time.tv_sec) * NANOSECONDS_IN_A_SECOND) +
+                    (abs_timeout.tv_nsec - start_time.tv_nsec);
+        }
+
+        remaining_waits = 0;
+        res = vk_wait_semaphores(device, &wait_info_dup, timeout, khr);
+
+        for (i = 0; i < wait_info->semaphoreCount; i++)
+        {
+            struct wine_semaphore * semaphore = wine_semaphore_from_handle(wait_info->pSemaphores[i]);
+
+            if (pending_waits[i])
+            {
+                remaining_waits++;
+
+                d3d12_semaphore_lock(semaphore);
+                if (res != VK_SUCCESS || pending_waits[i]->satisfied)
+                {
+                    values_dup[i] = pending_waits[i]->physical_value;
+                    d3d12_semaphore_pop_wait_locked(semaphore, pending_waits[i]);
+                    pending_waits[i] = NULL;
+                }
+                d3d12_semaphore_unlock(semaphore);
+            }
+        }
+    }
+    while (res == VK_SUCCESS && remaining_waits);
+
+    /* Make sure the physical value we waited on is processed before returning */
+    for (i = 0; i < wait_info_dup.semaphoreCount; i++)
+    {
+        struct wine_semaphore *semaphore = wine_semaphore_from_handle(wait_info_dup.pSemaphores[i]);
+
+        if (semaphore->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+        {
+            d3d12_semaphore_lock(semaphore);
+            if (wait_info->flags & VK_SEMAPHORE_WAIT_ANY_BIT)
+            {
+                if (!vk_get_semaphore_counter_value(device, semaphores_dup[i], &phys_val, khr))
+                    d3d12_semaphore_update_phys_val_locked(semaphore, phys_val);
+            }
+            else
+                d3d12_semaphore_update_phys_val_locked(semaphore, values_dup[i]);
+            d3d12_semaphore_unlock(semaphore);
+        }
+    }
+
+    free(semaphores_dup);
+    free(values_dup);
+    free(pending_waits);
+    return res;
+}
+
+static NTSTATUS vk_wait_semaphores(VkDevice device, const VkSemaphoreWaitInfo *wait_info, uint64_t timeout, bool khr)
+{
+    if (khr)
+        return thunk_vkWaitSemaphoresKHR(device, wait_info, timeout);
+    else
+        return thunk_vkWaitSemaphores(device, wait_info, timeout);
+}
+
+NTSTATUS wine_vkWaitSemaphores(void *args)
+{
+    struct vkWaitSemaphores_params *params = args;
+    VkDevice device = params->device;
+    const VkSemaphoreWaitInfo *wait_info = params->pWaitInfo;
+    uint64_t timeout = params->timeout;
+
+    return wine_vk_wait_semaphores(device, wait_info, timeout, false);
+}
+
+NTSTATUS wine_vkWaitSemaphoresKHR(void *args)
+{
+    struct vkWaitSemaphores_params *params = args;
+    VkDevice device = params->device;
+    const VkSemaphoreWaitInfo *wait_info = params->pWaitInfo;
+    uint64_t timeout = params->timeout;
+
+    return wine_vk_wait_semaphores(device, wait_info, timeout, true);
+}
+
+struct signal_op
+{
+    enum
+    {
+        SIGNAL_TYPE_SEMAPHORE,
+        SIGNAL_TYPE_FENCE,
+    } signal_type;
+
+    union
+    {
+        struct
+        {
+            struct wine_semaphore *obj;
+            uint64_t phys_val;
+
+            bool khr;
+        } semaphore;
+
+        struct wine_fence *fence;
+    };
+
+    struct list entry;
+};
+
+static void *queue_signaller_worker(void *arg)
+{
+    struct VkQueue_T *queue = (struct VkQueue_T *)arg;
+    VkSemaphoreWaitInfo wait_info;
+    struct signal_op *signal_op;
+    VkSemaphore sem_handle;
+    VkFence fence;
+    uint64_t buf;
+    VkResult vr;
+
+    while (!queue->stop)
+    {
+        pthread_mutex_lock(&queue->signaller_mutex);
+
+        while (list_empty(&queue->signal_ops))
+            pthread_cond_wait(&queue->signaller_cond, &queue->signaller_mutex);
+
+        signal_op = LIST_ENTRY(list_head(&queue->signal_ops), struct signal_op, entry);
+        list_remove(&signal_op->entry);
+
+        pthread_mutex_unlock(&queue->signaller_mutex);
+
+        if (signal_op->signal_type == SIGNAL_TYPE_SEMAPHORE)
+        {
+            wait_info.sType = VK_STRUCTURE_TYPE_SEMAPHORE_WAIT_INFO;
+            wait_info.pNext = NULL;
+            wait_info.flags = 0;
+            wait_info.semaphoreCount = 1;
+            sem_handle = wine_semaphore_to_handle(signal_op->semaphore.obj);
+            wait_info.pSemaphores = &sem_handle;
+            wait_info.pValues = &signal_op->semaphore.phys_val;
+            if ((vr = vk_wait_semaphores(queue->device, &wait_info, -1, signal_op->semaphore.khr)) < 0)
+            {
+                /* likely GPU hang */
+                fprintf(stderr, "winevulkan/queue_signaller_worker: Semaphore wait failed, vr %d.\n", vr);
+                continue;
+            }
+
+            d3d12_semaphore_lock(signal_op->semaphore.obj);
+            d3d12_semaphore_update_phys_val_locked(signal_op->semaphore.obj, signal_op->semaphore.phys_val);
+            d3d12_semaphore_unlock(signal_op->semaphore.obj);
+        }
+        else
+        {
+            fence = wine_fence_to_handle(signal_op->fence);
+
+            if ((vr = thunk_vkWaitForFences(queue->device, 1, &fence, VK_TRUE, -1)) < 0)
+            {
+                /* likely GPU hang */
+                fprintf(stderr, "winevulkan/queue_signaller_worker: Fence wait failed, vr %d.\n", vr);
+                continue;
+            }
+
+            buf = 1;
+            assert( write(signal_op->fence->eventfd, &buf, sizeof(buf)) != -1 );
+        }
+
+        free(signal_op);
+    }
+
+    return NULL;
+}
+
+static VkSubmitInfo *copy_VkSubmitInfo(const VkSubmitInfo *in, uint32_t submit_count)
+{
+    VkSubmitInfo *out = malloc(sizeof(*out) * submit_count);
+    unsigned int i;
+
+    for (i = 0; i < submit_count; i++)
+    {
+        out[i].sType = in[i].sType;
+        out[i].waitSemaphoreCount = in[i].waitSemaphoreCount;
+        out[i].pWaitSemaphores = memdup(in[i].pWaitSemaphores, in[i].waitSemaphoreCount, sizeof(out[i].pWaitSemaphores[0]));
+        out[i].pWaitDstStageMask = memdup(in[i].pWaitDstStageMask, in[i].waitSemaphoreCount, sizeof(out[i].pWaitDstStageMask[0]));
+        out[i].commandBufferCount = in[i].commandBufferCount;
+        out[i].pCommandBuffers = memdup(in[i].pCommandBuffers, in[i].commandBufferCount, sizeof(out[i].pCommandBuffers[0]));
+        out[i].signalSemaphoreCount = in[i].signalSemaphoreCount;
+        out[i].pSignalSemaphores = memdup(in[i].pSignalSemaphores, in[i].signalSemaphoreCount, sizeof(out[i].pSignalSemaphores[0]));
+
+        convert_VkSubmitInfo_struct_chain(in[i].pNext, &out[i]);
+    }
+
+    return out;
+}
+
+static void free_copied_VkSubmitInfo(VkSubmitInfo *info, uint32_t submit_count)
+{
+    unsigned int i;
+
+    for (i = 0; i < submit_count; i++)
+    {
+        free_VkSubmitInfo_struct_chain(&info[i]);
+
+        free((VkSemaphore *)         info[i].pWaitSemaphores);
+        free((VkPipelineStageFlags*) info[i].pWaitDstStageMask);
+        free((VkCommandBuffer*)      info[i].pCommandBuffers);
+        free((VkSemaphore*)          info[i].pSignalSemaphores);
+    }
+
+    free(info);
+}
+
+static VkSubmitInfo2 *copy_VkSubmitInfo2(const VkSubmitInfo2 *in, uint32_t submit_count)
+{
+    VkSubmitInfo2 *out = malloc(sizeof(*out) * submit_count);
+    VkCommandBufferSubmitInfo *cmdbuf_submit_info;
+    VkSemaphoreSubmitInfo *sem_submit_info;
+    unsigned int i, k;
+
+    for (i = 0; i < submit_count; i++)
+    {
+        out[i].sType = in[i].sType;
+        out[i].flags = in[i].flags;
+
+        out[i].waitSemaphoreInfoCount = in[i].waitSemaphoreInfoCount;
+        out[i].pWaitSemaphoreInfos = sem_submit_info = memdup(in[i].pWaitSemaphoreInfos,
+                                            in[i].waitSemaphoreInfoCount,
+                                            sizeof(out[i].pWaitSemaphoreInfos[0]));
+        for (k = 0; k < out[i].waitSemaphoreInfoCount; k++)
+        {
+            if (sem_submit_info[k].pNext)
+            {
+                FIXME("pNext chain conversion for VkSemaphoreSubmitInfo not supported.\n");
+                sem_submit_info[k].pNext = NULL;
+            }
+        }
+
+        out[i].commandBufferInfoCount = in[i].commandBufferInfoCount;
+        out[i].pCommandBufferInfos = cmdbuf_submit_info = memdup(in[i].pCommandBufferInfos,
+                                            in[i].commandBufferInfoCount,
+                                            sizeof(out[i].pCommandBufferInfos[0]));
+        for (k = 0; k < out[i].commandBufferInfoCount; k++)
+        {
+            if (cmdbuf_submit_info[k].pNext)
+            {
+                FIXME("pNext chain conversion for VkCommandBufferSubmitInfo not supported.\n");
+                cmdbuf_submit_info[k].pNext = NULL;
+            }
+        }
+
+        out[i].signalSemaphoreInfoCount = in[i].signalSemaphoreInfoCount;
+        out[i].pSignalSemaphoreInfos = sem_submit_info =memdup(in[i].pSignalSemaphoreInfos,
+                                              in[i].signalSemaphoreInfoCount,
+                                              sizeof(out[i].pSignalSemaphoreInfos[0]));
+        for (k = 0; k < out[i].signalSemaphoreInfoCount; k++)
+        {
+            if (sem_submit_info[k].pNext)
+            {
+                FIXME("pNext chain conversion for VkSemaphoreSubmitInfo not supported.\n");
+                sem_submit_info[k].pNext = NULL;
+            }
+        }
+
+        convert_VkSubmitInfo2_struct_chain(in[i].pNext, &out[i]);
+    }
+
+    return out;
+}
+
+static void free_copied_VkSubmitInfo2(VkSubmitInfo2 *info, uint32_t submit_count)
+{
+    unsigned int i;
+
+    for (i = 0; i < submit_count; i++)
+    {
+        free_VkSubmitInfo2_struct_chain(&info[i]);
+
+        free((VkSemaphoreSubmitInfo  *)    info[i].pWaitSemaphoreInfos);
+        free((VkCommandBufferSubmitInfo *) info[i].pCommandBufferInfos);
+        free((VkSemaphoreSubmitInfo *)     info[i].pSignalSemaphoreInfos);
+    }
+
+    free(info);
+}
+
+struct queue_submit_unit
+{
+    uint32_t submit_count;
+    VkSubmitInfo *submits;
+    VkSubmitInfo2 *submits2;
+    VkFence fence;
+    bool khr;
+
+    struct pending_wait **waits;
+
+    struct list entry;
+};
+
+/* Abstracts away the differences between VkSubmitInfo and VkSubmitInfo2. */
+static bool for_each_d3d12_semaphore(struct queue_submit_unit *unit, bool signal,
+                                     struct wine_semaphore **semaphore_out, uint64_t **value_out, uint32_t counter)
+{
+    VkTimelineSemaphoreSubmitInfo *timeline_values;
+    struct wine_semaphore *semaphore;
+    unsigned int i, j, k;
+    uint32_t sem_count;
+
+    for (i = 0, k = 0; i < unit->submit_count; i++)
+    {
+        if (unit->submits)
+        {
+            timeline_values = wine_vk_find_struct(&unit->submits[i], TIMELINE_SEMAPHORE_SUBMIT_INFO);
+
+            if (signal)
+                sem_count = unit->submits[i].signalSemaphoreCount;
+            else
+                sem_count = unit->submits[i].waitSemaphoreCount;
+
+            for (j = 0; j < sem_count; j++)
+            {
+                if (signal)
+                    semaphore = wine_semaphore_from_handle(unit->submits[i].pSignalSemaphores[j]);
+                else
+                    semaphore = wine_semaphore_from_handle(unit->submits[i].pWaitSemaphores[j]);
+
+                if (!(semaphore->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT))
+                    continue;
+
+                if (k++ == counter)
+                {
+                    *semaphore_out = semaphore;
+                    if (signal)
+                        *value_out = (uint64_t *) &timeline_values->pSignalSemaphoreValues[j];
+                    else
+                        *value_out = (uint64_t *) &timeline_values->pWaitSemaphoreValues[j];
+                    return true;
+                }
+            }
+        }
+        else
+        {
+            if (signal)
+                sem_count = unit->submits2[i].signalSemaphoreInfoCount;
+            else
+                sem_count = unit->submits2[i].waitSemaphoreInfoCount;
+
+            for (j = 0; j < sem_count; j++)
+            {
+                if (signal)
+                    semaphore = wine_semaphore_from_handle(unit->submits2[i].pSignalSemaphoreInfos[j].semaphore);
+                else
+                    semaphore = wine_semaphore_from_handle(unit->submits2[i].pWaitSemaphoreInfos[j].semaphore);
+
+                if (!(semaphore->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT))
+                    continue;
+
+                if (k++ == counter)
+                {
+                    *semaphore_out = semaphore;
+                    if (signal)
+                        *value_out = (uint64_t *) &unit->submits2[i].pSignalSemaphoreInfos[j].value;
+                    else
+                        *value_out = (uint64_t *) &unit->submits2[i].pWaitSemaphoreInfos[j].value;
+                    return true;
+                }
+            }
+        }
+    }
+
+    return false;
+}
+
+static void *virtual_queue_worker(void *arg)
+{
+    struct VkQueue_T *queue = (struct VkQueue_T *)arg;
+    struct queue_submit_unit *submit_unit;
+    struct signal_op *signal_op;
+    struct wine_semaphore *sem;
+    struct pending_wait *wait;
+    struct wine_fence *fence;
+    bool device_lost = false;
+    uint64_t *timeline_value;
+    unsigned int i;
+    VkResult vr;
+
+    while (!queue->stop)
+    {
+        pthread_mutex_lock(&queue->submissions_mutex);
+
+        while (list_empty(&queue->submissions))
+            pthread_cond_wait(&queue->submissions_cond, &queue->submissions_mutex);
+
+        submit_unit = LIST_ENTRY(list_head(&queue->submissions), struct queue_submit_unit, entry);
+        list_remove(&submit_unit->entry);
+
+        pthread_mutex_unlock(&queue->submissions_mutex);
+
+        if (device_lost)
+            goto free_submit_unit;
+
+        /* Wait for all fences to have a pending signal */
+        for (i = 0; for_each_d3d12_semaphore(submit_unit, false, &sem, &timeline_value, i); i++)
+        {
+            if ((wait = submit_unit->waits[i++]))
+            {
+                assert(wait);
+                d3d12_semaphore_lock(sem);
+
+                while (!wait->satisfied)
+                    pthread_cond_wait(&wait->cond, &sem->d3d12_fence_shm->mutex);
+
+                *timeline_value = d3d12_semaphore_pop_wait_locked(sem, wait);
+
+                d3d12_semaphore_unlock(sem);
+            }
+        }
+
+        for (i = 0; for_each_d3d12_semaphore(submit_unit, true, &sem, &timeline_value, i); i++)
+        {
+            d3d12_semaphore_lock(sem);
+
+            *timeline_value = d3d12_semaphore_add_pending_signal_locked(sem, *timeline_value, queue);
+        }
+
+        if (submit_unit->submits)
+            vr = thunk_vkQueueSubmit(queue, submit_unit->submit_count, submit_unit->submits, submit_unit->fence);
+        else
+        {
+            if (submit_unit->khr)
+                vr = thunk_vkQueueSubmit2KHR(queue, submit_unit->submit_count, submit_unit->submits2, submit_unit->fence);
+            else
+                vr = thunk_vkQueueSubmit2(queue, submit_unit->submit_count, submit_unit->submits2, submit_unit->fence);
+        }
+
+        pthread_mutex_lock(&queue->signaller_mutex);
+
+        for (i = 0; for_each_d3d12_semaphore(submit_unit, true, &sem, &timeline_value, i); i++)
+        {
+            if (vr == VK_SUCCESS)
+            {
+                struct pending_update added_signal = d3d12_semaphore_peek_added_signal_locked(sem);
+                d3d12_semaphore_satisfy_waits_locked(sem, added_signal.virtual_value, added_signal.physical_value);
+
+                signal_op = malloc(sizeof(*signal_op));
+                signal_op->signal_type = SIGNAL_TYPE_SEMAPHORE;
+                signal_op->semaphore.obj = sem;
+                signal_op->semaphore.phys_val = added_signal.physical_value;
+                signal_op->semaphore.khr = submit_unit->khr;
+
+                list_add_tail(&queue->signal_ops, &signal_op->entry);
+            }
+            else
+            {
+                d3d12_semaphore_pop_pending_signal_locked(sem, *timeline_value, NULL);
+            }
+
+            d3d12_semaphore_unlock(sem);
+        }
+
+        if (vr == VK_SUCCESS && (fence = wine_fence_from_handle(submit_unit->fence)))
+        {
+            signal_op = malloc(sizeof(*signal_op));
+            signal_op->signal_type = SIGNAL_TYPE_FENCE;
+            signal_op->fence = fence;
+
+            list_add_tail(&queue->signal_ops, &signal_op->entry);
+        }
+
+        pthread_cond_signal(&queue->signaller_cond);
+        pthread_mutex_unlock(&queue->signaller_mutex);
+
+        if (vr != VK_SUCCESS)
+        {
+            fprintf(stderr, "winevulkan/virtual_queue_worker: queue submission failed with %d, treating as DEVICE_LOST.\n", vr);
+            pthread_mutex_lock(&queue->submissions_mutex);
+            queue->device_lost = device_lost = true;
+            pthread_mutex_unlock(&queue->submissions_mutex);
+
+            if ((fence = wine_fence_from_handle(submit_unit->fence)))
+            {
+                uint64_t buf = 1;
+                assert( write(fence->eventfd, &buf, sizeof(buf)) != -1 );
+            }
+        }
+
+free_submit_unit:
+        if (submit_unit->submits)
+            free_copied_VkSubmitInfo(submit_unit->submits, submit_unit->submit_count);
+        else
+            free_copied_VkSubmitInfo2(submit_unit->submits2, submit_unit->submit_count);
+        free(submit_unit->waits);
+        free(submit_unit);
+
+        pthread_mutex_lock(&queue->submissions_mutex);
+        if (list_empty(&queue->submissions))
+        {
+            queue->processing = false;
+            if (device_lost)
+            {
+                queue->stop = true;
+                pthread_cond_signal(&queue->signaller_cond);
+            }
+        }
+        pthread_cond_signal(&queue->submissions_cond);
+        pthread_mutex_unlock(&queue->submissions_mutex);
+    }
+
+    return NULL;
+}
+
+static bool is_virtual_queue(struct VkQueue_T *queue)
+{
+    return !__sync_bool_compare_and_swap(&queue->virtual_queue, 0, 0);
+}
+
+static void init_virtual_queue(struct VkQueue_T *queue)
+{
+    if (is_virtual_queue(queue))
+        return;
+
+    pthread_mutex_lock(&queue->submissions_mutex);
+
+    if (!__sync_bool_compare_and_swap(&queue->virtual_queue, 0, 1))
+    {
+        pthread_mutex_unlock(&queue->submissions_mutex);
+        return;
+    }
+
+    pthread_create(&queue->virtual_queue_thread, NULL, virtual_queue_worker, queue);
+    pthread_create(&queue->signal_thread, NULL, queue_signaller_worker, queue);
+
+    queue->virtual_queue = true;
+
+    pthread_mutex_unlock(&queue->submissions_mutex);
+}
+
+static NTSTATUS virtual_queue_submit(struct VkQueue_T *queue, uint32_t submit_count, const VkSubmitInfo *submits, VkFence fence)
+{
+    VkTimelineSemaphoreSubmitInfo *timeline_submit_info, *host_timeline_values;
+    VkD3D12FenceSubmitInfoKHR *d3d12_submit_info;
+    struct queue_submit_unit *submit_unit;
+    struct wine_semaphore *sem;
+    unsigned int i, j, k;
+    uint64_t wait_value;
+    bool device_lost;
+
+    init_virtual_queue(queue);
+
+    pthread_mutex_lock(&queue->submissions_mutex);
+    device_lost = queue->device_lost;
+    pthread_mutex_unlock(&queue->submissions_mutex);
+    if (device_lost)
+        return VK_ERROR_DEVICE_LOST;
+
+    submit_unit = malloc(sizeof(*submit_unit));
+    submit_unit->submit_count = submit_count;
+    submit_unit->submits = copy_VkSubmitInfo(submits, submit_count);
+    submit_unit->submits2 = NULL;
+    submit_unit->fence = fence;
+    submit_unit->waits = NULL;
+    submit_unit->khr = queue->device->phys_dev->api_version < VK_API_VERSION_1_2 ||
+                       queue->device->phys_dev->instance->api_version < VK_API_VERSION_1_2;
+
+    /* As D3D12 fences are rewindable, we add the wait synchronously as not to miss a temporarily signalled value
+     between vkQueueSubmit and processing the submit unit*/
+    for (i = 0, k = 0; i < submit_count; i++)
+    {
+        timeline_submit_info = wine_vk_find_struct(&submits[i], TIMELINE_SEMAPHORE_SUBMIT_INFO);
+        d3d12_submit_info = wine_vk_find_struct(&submits[i], D3D12_FENCE_SUBMIT_INFO_KHR);
+
+        host_timeline_values = wine_vk_find_struct(&submit_unit->submits[i], TIMELINE_SEMAPHORE_SUBMIT_INFO);
+
+        if (d3d12_submit_info && !host_timeline_values)
+        {
+            host_timeline_values = malloc(sizeof(*host_timeline_values));
+
+            host_timeline_values->sType = VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO;
+            host_timeline_values->pNext = submit_unit->submits[i].pNext;
+            host_timeline_values->waitSemaphoreValueCount = d3d12_submit_info->waitSemaphoreValuesCount;
+            host_timeline_values->pWaitSemaphoreValues =
+                    memdup(d3d12_submit_info->pWaitSemaphoreValues, d3d12_submit_info->waitSemaphoreValuesCount,
+                        sizeof(host_timeline_values->pWaitSemaphoreValues[0]));
+            host_timeline_values->signalSemaphoreValueCount = d3d12_submit_info->signalSemaphoreValuesCount;
+            host_timeline_values->pSignalSemaphoreValues =
+                    memdup(d3d12_submit_info->pSignalSemaphoreValues, d3d12_submit_info->signalSemaphoreValuesCount,
+                        sizeof(host_timeline_values->pSignalSemaphoreValues[0]));
+
+            submit_unit->submits[i].pNext = host_timeline_values;
+        }
+
+        for (j = 0; j < submits[i].waitSemaphoreCount; j++)
+        {
+            sem = wine_semaphore_from_handle(submits[i].pWaitSemaphores[j]);
+
+            if (!(sem->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT))
+                continue;
+
+            if (timeline_submit_info)
+                wait_value = timeline_submit_info->pWaitSemaphoreValues[j];
+            else
+                wait_value = d3d12_submit_info->pWaitSemaphoreValues[j];
+
+            submit_unit->waits = realloc(submit_unit->waits, (k + 1) * sizeof(*submit_unit->waits));
+            submit_unit->waits[k] = NULL;
+
+            d3d12_semaphore_lock(sem);
+
+            if ((((uint64_t*)host_timeline_values->pWaitSemaphoreValues)[j] =
+                                d3d12_semaphore_try_get_wait_value_locked(sem, wait_value, queue)) == -1)
+                submit_unit->waits[k] = d3d12_semaphore_push_wait_locked(sem, wait_value);
+
+            d3d12_semaphore_unlock(sem);
+            k++;
+        }
+    }
+
+    pthread_mutex_lock(&queue->submissions_mutex);
+    queue->processing = true;
+    if (fence)
+    {
+        wine_fence_from_handle(fence)->queue = queue;
+        wine_fence_from_handle(fence)->wait_assist = true;
+    }
+    list_add_tail(&queue->submissions, &submit_unit->entry);
+    pthread_cond_signal(&queue->submissions_cond);
+    pthread_mutex_unlock(&queue->submissions_mutex);
+
+    return VK_SUCCESS;
+}
+
+NTSTATUS wine_vkQueueSubmit(void *args)
+{
+    struct vkQueueSubmit_params *params = args;
+    VkQueue queue = params->queue;
+    uint32_t submit_count = params->submitCount;
+    const VkSubmitInfo *submits = params->pSubmits;
+    VkFence fence = params->fence;
+
+    unsigned int i, k;
+
+    TRACE("(%p %u %p 0x%s)\n", queue, submit_count, submits, wine_dbgstr_longlong(fence));
+
+    if (is_virtual_queue(queue))
+        return virtual_queue_submit(queue, submit_count, submits, fence);
+
+    for (i = 0; i < submit_count; i++)
+    {
+        for (k = 0; k < submits[i].waitSemaphoreCount; k++)
+        {
+            if (wine_semaphore_from_handle(submits[i].pWaitSemaphores[k])->handle_types &
+                    VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+                return virtual_queue_submit(queue, submit_count, submits, fence);
+        }
+
+        for (k = 0; k < submits[i].signalSemaphoreCount; k++)
+        {
+            if (wine_semaphore_from_handle(submits[i].pSignalSemaphores[k])->handle_types &
+                    VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+                return virtual_queue_submit(queue, submit_count, submits, fence);
+        }
+    }
+
+    if (fence)
+        wine_fence_from_handle(fence)->queue = queue;
+
+    return thunk_vkQueueSubmit(queue, submit_count, submits, fence);
+}
+
+static NTSTATUS virtual_queue_submit2(struct VkQueue_T *queue, uint32_t submit_count, const VkSubmitInfo2 *submits, VkFence fence, bool khr)
+{
+    VkSemaphoreSubmitInfo *sem_submit_info;
+    struct queue_submit_unit *submit_unit;
+    VkSubmitInfo2 *queue_submit;
+    struct wine_semaphore *sem;
+    unsigned int i, j, k;
+    uint64_t wait_value;
+    bool device_lost;
+
+    init_virtual_queue(queue);
+
+    pthread_mutex_lock(&queue->submissions_mutex);
+    device_lost = queue->device_lost;
+    pthread_mutex_unlock(&queue->submissions_mutex);
+    if (device_lost)
+        return VK_ERROR_DEVICE_LOST;
+
+    submit_unit = malloc(sizeof(*submit_unit));
+    submit_unit->submit_count = submit_count;
+    submit_unit->submits = NULL;
+    submit_unit->submits2 = copy_VkSubmitInfo2(submits, submit_count);
+    submit_unit->fence = fence;
+    submit_unit->waits = NULL;
+    submit_unit->khr = khr;
+
+    /* As D3D12 fences are rewindable, we add the wait synchronously as not to miss a temporarily signalled value
+     between vkQueueSubmit and processing the submit unit */
+    for (i = 0, k = 0; i < submit_count; i++)
+    {
+        queue_submit = &submit_unit->submits2[i];
+
+        for (j = 0; j < queue_submit->waitSemaphoreInfoCount; j++)
+        {
+            sem_submit_info = (VkSemaphoreSubmitInfo *) &queue_submit->pWaitSemaphoreInfos[j];
+            sem = wine_semaphore_from_handle(sem_submit_info->semaphore);
+
+            if (!(sem->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT))
+                continue;
+
+            wait_value = sem_submit_info->value;
+
+            submit_unit->waits = realloc(submit_unit->waits, (k + 1) * sizeof(*submit_unit->waits));
+            submit_unit->waits[k] = NULL;
+
+            d3d12_semaphore_lock(sem);
+
+            if ((sem_submit_info->value =
+                                d3d12_semaphore_try_get_wait_value_locked(sem, wait_value, queue)) == -1)
+                submit_unit->waits[k] = d3d12_semaphore_push_wait_locked(sem, wait_value);
+
+            d3d12_semaphore_unlock(sem);
+            k++;
+        }
+    }
+
+    pthread_mutex_lock(&queue->submissions_mutex);
+    queue->processing = true;
+    if (fence)
+    {
+        wine_fence_from_handle(fence)->queue = queue;
+        wine_fence_from_handle(fence)->wait_assist = true;
+    }
+    list_add_tail(&queue->submissions, &submit_unit->entry);
+    pthread_cond_signal(&queue->submissions_cond);
+    pthread_mutex_unlock(&queue->submissions_mutex);
+
+    return VK_SUCCESS;
+}
+
+static NTSTATUS vk_queue_submit_2(VkQueue queue, uint32_t submit_count, const VkSubmitInfo2 *submits, VkFence fence, bool khr)
+{
+    unsigned int i, k;
+
+    TRACE("(%p, %u, %p, %s)\n", queue, submit_count, submits, wine_dbgstr_longlong(fence));
+
+    if (is_virtual_queue(queue))
+        return virtual_queue_submit2(queue, submit_count, submits, fence, khr);
+
+    for (i = 0; i < submit_count; i++)
+    {
+        for (k = 0; k < submits[i].waitSemaphoreInfoCount; k++)
+        {
+            if (wine_semaphore_from_handle(submits[i].pWaitSemaphoreInfos[k].semaphore)->handle_types &
+                    VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+                return virtual_queue_submit2(queue, submit_count, submits, fence, khr);
+        }
+
+        for (k = 0; k < submits[i].signalSemaphoreInfoCount; k++)
+        {
+            if (wine_semaphore_from_handle(submits[i].pSignalSemaphoreInfos[k].semaphore)->handle_types &
+                    VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+                return virtual_queue_submit2(queue, submit_count, submits, fence, khr);
+        }
+    }
+
+    if (fence)
+        wine_fence_from_handle(fence)->queue = queue;
+
+    if (khr)
+        return thunk_vkQueueSubmit2KHR(queue, submit_count, submits, fence);
+    else
+        return thunk_vkQueueSubmit2(queue, submit_count, submits, fence);
+}
+
+NTSTATUS wine_vkQueueSubmit2(void *args)
+{
+    struct vkQueueSubmit2_params *params = args;
+    VkQueue queue = params->queue;
+    uint32_t submit_count = params->submitCount;
+    const VkSubmitInfo2 *submits = params->pSubmits;
+    VkFence fence = params->fence;
+
+    return vk_queue_submit_2(queue, submit_count, submits, fence, false);
+}
+
+NTSTATUS wine_vkQueueSubmit2KHR(void *args)
+{
+    struct vkQueueSubmit2_params *params = args;
+    VkQueue queue = params->queue;
+    uint32_t submit_count = params->submitCount;
+    const VkSubmitInfo2 *submits = params->pSubmits;
+    VkFence fence = params->fence;
+
+    return vk_queue_submit_2(queue, submit_count, submits, fence, true);
+}
+
+NTSTATUS wine_vkQueuePresentKHR(void *args)
+{
+    struct vkQueuePresentKHR_params *params = args;
+    VkQueue queue = params->queue;
+    const VkPresentInfoKHR *present_info = params->pPresentInfo;
+
+    struct wine_semaphore *semaphore;
+    unsigned int i;
+
+    TRACE("%p %p\n", queue, present_info);
+
+    for (i = 0; i < present_info->waitSemaphoreCount; i++)
+    {
+        semaphore = wine_semaphore_from_handle(present_info->pWaitSemaphores[i]);
+
+        if (semaphore->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+        {
+            FIXME("Waiting on D3D12-Fence compatible timeline semaphore not supported.\n");
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+
+    if (is_virtual_queue(queue))
+    {
+        pthread_mutex_lock(&queue->submissions_mutex);
+        while (queue->processing)
+            pthread_cond_wait(&queue->submissions_cond, &queue->submissions_mutex);
+        pthread_mutex_unlock(&queue->submissions_mutex);
+    }
+    return fshack_vk_queue_present(queue, present_info);
+}
+
+NTSTATUS wine_vkQueueBindSparse(void *args)
+{
+    struct vkQueueBindSparse_params *params = args;
+    VkQueue queue = params->queue;
+    uint32_t bind_info_count = params->bindInfoCount;
+    const VkBindSparseInfo *bind_info = params->pBindInfo;
+    VkFence fence = params->fence;
+
+    struct wine_semaphore *semaphore;
+    const VkBindSparseInfo *batch;
+    unsigned int i, k;
+
+    TRACE("(%p, %u, %p, 0x%s)\n", queue, bind_info_count, bind_info, wine_dbgstr_longlong(fence));
+
+    if (is_virtual_queue(queue))
+    {
+        FIXME("Can't process sparse bind calls on virtual queue, flushing.\n");
+        pthread_mutex_lock(&queue->submissions_mutex);
+        while (queue->processing)
+            pthread_cond_wait(&queue->submissions_cond, &queue->submissions_mutex);
+        pthread_mutex_unlock(&queue->submissions_mutex);
+    }
+
+    for (i = 0; i < bind_info_count; i++)
+    {
+        batch = &bind_info[i];
+
+        for (k = 0; k < batch->waitSemaphoreCount; k++)
+        {
+            semaphore = wine_semaphore_from_handle(batch->pWaitSemaphores[k]);
+
+            if (semaphore->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+            {
+                FIXME("Waiting on D3D12-Fence compatible timeline semaphore not supported.\n");
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+        }
+
+        for(k = 0; k < batch->signalSemaphoreCount; k++)
+        {
+            semaphore = wine_semaphore_from_handle(batch->pSignalSemaphores[k]);
+
+            if (semaphore->handle_types & VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT)
+            {
+                FIXME("Signalling D3D12-Fence compatible timeline semaphore not supported.\n");
+                return VK_ERROR_OUT_OF_HOST_MEMORY;
+            }
+        }
+    }
+
+    return thunk_vkQueueBindSparse(queue, bind_info_count, bind_info, fence);
+}
+
+NTSTATUS wine_vkCreateFence(void *args)
+{
+    struct vkCreateFence_params *params = args;
+    VkDevice device = params->device;
+    const VkFenceCreateInfo *create_info = params->pCreateInfo;
+    const VkAllocationCallbacks *allocator = params->pAllocator;
+    VkFence *fence = params->pFence;
+
+    struct wine_fence *object;
+    VkResult vr;
+
+    TRACE("(%p, %p, %p, %p)\n", device, create_info, allocator, fence);
+
+    if (allocator)
+        FIXME("Support for allocation callbacks not implemented yet\n");
+
+    if (!(object = calloc(1, sizeof(*object))))
+        return VK_ERROR_OUT_OF_HOST_MEMORY;
+
+    if ((object->eventfd = eventfd(0, EFD_CLOEXEC)) == -1)
+        ERR("Failed to create eventfd for fence.\n");
+
+    if ((vr = device->funcs.p_vkCreateFence(device->device, create_info, allocator, &object->fence)) == VK_SUCCESS)
+        *fence = wine_fence_to_handle(object);
+    else
+        free(object);
+
+    return vr;
+}
+
+NTSTATUS wine_vkDestroyFence(void *args)
+{
+    struct vkDestroyFence_params *params = args;
+    VkDevice device = params->device;
+    VkFence handle = params->fence;
+    const VkAllocationCallbacks *allocator = params->pAllocator;
+
+    struct wine_fence *fence = wine_fence_from_handle(handle);
+
+    TRACE("(%p, %p, %p)\n", device, fence, allocator);
+
+    if (allocator)
+        FIXME("Support for allocation callbacks not implemented yet\n");
+
+    if (fence->eventfd != -1)
+        close(fence->eventfd);
+
+    device->funcs.p_vkDestroyFence(device->device, fence->fence, allocator);
+    free(fence);
+
+    return STATUS_SUCCESS;
+}
+
+NTSTATUS wine_vkResetFences(void *args)
+{
+    struct vkResetFences_params *params = args;
+    VkDevice device = params->device;
+    uint32_t fence_count = params->fenceCount;
+    const VkFence *fences = params->pFences;
+
+    struct wine_fence *fence;
+    unsigned int i;
+    uint64_t buf;
+    VkResult vr;
+
+    TRACE("(%p, %u, %p)\n", device, fence_count, fences);
+
+    if ((vr = thunk_vkResetFences(device, fence_count, fences)) != VK_SUCCESS)
+        return vr;
+
+    for (i = 0; i < fence_count; i++)
+    {
+        fence = wine_fence_from_handle(fences[i]);
+
+        fence->queue = NULL;
+        fence->swapchain = NULL;
+        if (fence->wait_assist)
+        {
+            fence->wait_assist = false;
+            if (read(fence->eventfd, &buf, sizeof(buf)) == -1)
+                ERR("Failed to reset event fd.\n");
+        }
+    }
+
+    return VK_SUCCESS;
+}
+
+NTSTATUS wine_vkWaitForFences(void *args)
+{
+    struct vkWaitForFences_params *params = args;
+    VkDevice device = params->device;
+    uint32_t fence_count = params->fenceCount;
+    const VkFence *fences = params->pFences;
+    VkBool32 wait_all = params->waitAll;
+    uint64_t timeout = params->timeout;
+
+    struct signal_op *signal_op;
+    bool assisted_wait = false;
+    struct wine_fence *fence;
+    struct pollfd *wait_fds;
+    struct pollfd wait_fd;
+    unsigned int i;
+    VkResult vr;
+
+    TRACE("(%p, %u, %p, %u, 0x%s)\n", device, fence_count, fences, wait_all, wine_dbgstr_longlong(timeout));
+
+    for (i = 0; i < fence_count; i++)
+    {
+        fence = wine_fence_from_handle(fences[i]);
+        if (!fence->wait_assist)
+            continue;
+
+        if (!wait_all && fence_count > 1)
+        {
+            assisted_wait = true;
+            break;
+        }
+
+        wait_fd.fd = fence->eventfd;
+        wait_fd.events = POLLIN;
+        if (poll(&wait_fd, 1, timeout / 1000000) == -1)
+        {
+            ERR("Failed to poll wait assisted fence.\n");
+            return VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+    }
+
+    if (assisted_wait)
+    {
+        /* Turn all non assisted waits into assisted waits, then poll on all */
+        wait_fds = malloc( sizeof(wait_fds[0]) * fence_count );
+
+        for (i = 0; i < fence_count; i++)
+        {
+            if (!fence->wait_assist)
+            {
+                assert(fence->queue || fence->swapchain);
+
+                if (fence->queue)
+                {
+                    fence->wait_assist = true;
+
+                    /* If virtual-queue requiring work was submitted after the work signalling this mutex,
+                     * we will end up unnecessarily waiting on that work first,
+                     * but this will only happen once per queue */
+                    init_virtual_queue(fence->queue);
+
+                    signal_op = malloc(sizeof(*signal_op));
+                    signal_op->signal_type = SIGNAL_TYPE_FENCE;
+                    signal_op->fence = fence;
+
+                    pthread_mutex_lock(&fence->queue->signaller_mutex);
+                    list_add_tail(&fence->queue->signal_ops, &signal_op->entry);
+                    pthread_cond_signal(&fence->queue->signaller_cond);
+                    pthread_mutex_unlock(&fence->queue->signaller_mutex);
+                }
+                else
+                {
+                    FIXME("Wait assist for swapchain signaled fences not supported.\n");
+                    free(wait_fds);
+                    return VK_ERROR_OUT_OF_HOST_MEMORY;
+                }
+            }
+
+            wait_fds[i].fd = fence->eventfd;
+            wait_fds[i].events = POLLIN;
+        }
+
+        if (poll(wait_fds, fence_count, timeout / 1000000) == -1)
+        {
+            ERR("Failed to poll wait assisted fences.\n");
+            vr = VK_ERROR_OUT_OF_HOST_MEMORY;
+        }
+
+        free(wait_fds);
+    }
+    else
+    {
+        vr = thunk_vkWaitForFences(device, fence_count, fences, wait_all, timeout);
+    }
+
+    return vr;
+}
+
+NTSTATUS wine_vkQueueWaitIdle(void *args)
+{
+    struct vkQueueWaitIdle_params *params = args;
+    VkQueue queue = params->queue;
+
+    TRACE("(%p)\n", queue);
+
+    if (is_virtual_queue(queue))
+    {
+        pthread_mutex_lock(&queue->submissions_mutex);
+        while (queue->processing)
+            pthread_cond_wait(&queue->submissions_cond, &queue->submissions_mutex);
+        pthread_mutex_unlock(&queue->submissions_mutex);
+    }
+
+    return queue->device->funcs.p_vkQueueWaitIdle(queue->queue);
 }
