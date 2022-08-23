@@ -244,6 +244,7 @@ extern void CDECL X11DRV_WindowPosChanged( HWND hwnd, HWND insert_after, UINT sw
                                            struct window_surface *surface ) DECLSPEC_HIDDEN;
 extern BOOL CDECL X11DRV_SystemParametersInfo( UINT action, UINT int_param, void *ptr_param,
                                                UINT flags ) DECLSPEC_HIDDEN;
+extern void CDECL X11DRV_UpdateCandidatePos( HWND hwnd, const RECT *caret_rect ) DECLSPEC_HIDDEN;
 extern void CDECL X11DRV_ThreadDetach(void) DECLSPEC_HIDDEN;
 
 /* X11 driver internal functions */
@@ -339,6 +340,7 @@ extern int *get_window_surface_mapping( int bpp, int *mapping ) DECLSPEC_HIDDEN;
 enum x11drv_escape_codes
 {
     X11DRV_SET_DRAWABLE,     /* set current drawable for a DC */
+    X11DRV_GET_DRAWABLE,     /* get current drawable for a DC */
     X11DRV_START_EXPOSURES,  /* start graphics exposures */
     X11DRV_END_EXPOSURES,    /* end graphics exposures */
     X11DRV_PRESENT_DRAWABLE, /* present the drawable on screen */
@@ -350,6 +352,14 @@ struct x11drv_escape_set_drawable
     Drawable                 drawable;     /* X drawable */
     int                      mode;         /* ClipByChildren or IncludeInferiors */
     RECT                     dc_rect;      /* DC rectangle relative to drawable */
+};
+
+struct x11drv_escape_get_drawable
+{
+    enum x11drv_escape_codes code;         /* escape code (X11DRV_GET_DRAWABLE) */
+    Drawable                 drawable;     /* X drawable */
+    Drawable                 gl_drawable;  /* GL drawable */
+    int                      pixel_format; /* internal GL pixel format */
 };
 
 struct x11drv_escape_present_drawable
@@ -690,6 +700,7 @@ extern void set_wm_hints( struct x11drv_win_data *data ) DECLSPEC_HIDDEN;
 extern BOOL fs_hack_enabled(HMONITOR monitor) DECLSPEC_HIDDEN;
 extern BOOL fs_hack_mapping_required(HMONITOR monitor) DECLSPEC_HIDDEN;
 extern BOOL fs_hack_is_integer(void) DECLSPEC_HIDDEN;
+extern BOOL fs_hack_is_fsr(float *sharpness) DECLSPEC_HIDDEN;
 extern HMONITOR fs_hack_monitor_from_hwnd(HWND hwnd) DECLSPEC_HIDDEN;
 extern HMONITOR fs_hack_monitor_from_rect(const RECT *rect) DECLSPEC_HIDDEN;
 extern BOOL fs_hack_matches_current_mode(HMONITOR monitor, INT width, INT height) DECLSPEC_HIDDEN;
