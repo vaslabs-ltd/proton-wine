@@ -168,7 +168,9 @@ LONG call_vectored_handlers( EXCEPTION_RECORD *rec, CONTEXT *context )
 
         TRACE( "calling handler at %p code=%x flags=%x\n",
                func, rec->ExceptionCode, rec->ExceptionFlags );
+        __asm__ __volatile__(".rept 16 ; nop ; .endr");
         ret = func( &except_ptrs );
+        __asm__ __volatile__(".rept 16 ; nop ; .endr");
         TRACE( "handler at %p returned %x\n", func, ret );
 
         RtlEnterCriticalSection( &vectored_handlers_section );
