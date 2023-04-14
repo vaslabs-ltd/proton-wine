@@ -712,7 +712,6 @@ static ssize_t fixup_icmp_over_dgram( struct msghdr *hdr, union unix_sockaddr *u
             icmp_h->checksum = chksum( (BYTE *)icmp_h, recv_len - sizeof(ip_h) );
         }
     }
-    ip_h.checksum = 0;
     ip_h.checksum = chksum( (BYTE *)&ip_h, sizeof(ip_h) );
     memcpy( buf, &ip_h, min( sizeof(ip_h), buf_len ));
 
@@ -1638,6 +1637,37 @@ NTSTATUS sock_ioctl( HANDLE handle, HANDLE event, PIO_APC_ROUTINE apc, void *apc
             if (needs_close) close( fd );
             complete_async( handle, event, apc, apc_user, io, STATUS_SUCCESS, 0 );
             return STATUS_SUCCESS;
+        }
+
+        case IOCTL_AFD_WINE_SEND_BACKLOG_QUERY:
+        {
+            int proto;
+            unsigned protolen = sizeof(protolen);
+
+            if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
+                return status;
+
+            if (out_size < sizeof(DWORD))
+            {
+                status = STATUS_BUFFER_TOO_SMALL;
+                break;
+            }
+
+            if (getsockopt( fd, SOL_SOCKET, SO_PROTOCOL, &proto, &protolen ) < 0)
+            {
+                status = sock_errno_to_status( errno );
+                break;
+            }
+
+            if(proto != IPPROTO_TCP)
+            {
+                status = STATUS_NOT_SUPPORTED;
+                break;
+            }
+
+            *(DWORD*)out_buffer = 0x10000; /* 64k */
+
+            break;
         }
 
         case IOCTL_AFD_WINE_SIOCATMARK:

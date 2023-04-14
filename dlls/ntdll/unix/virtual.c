@@ -115,6 +115,10 @@ struct file_view
     unsigned int  protect;       /* protection for all pages at allocation time and SEC_* flags */
 };
 
+#define SYMBOLIC_LINK_QUERY 0x0001
+
+#define SYMBOLIC_LINK_QUERY 0x0001
+
 /* per-page protection flags */
 #define VPROT_READ       0x01
 #define VPROT_WRITE      0x02
@@ -3276,7 +3280,7 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
         server_enter_uninterrupted_section( &virtual_mutex, &sigset );
         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
         {
-            TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+            TEB *teb = CONTAINING_RECORD( (GDI_TEB_BATCH *)thread_data, TEB, GdiTebBatch );
 #ifdef _WIN64
             WOW_TEB *wow_teb = get_wow_teb( teb );
             if (wow_teb) wow_teb->TlsSlots[index] = 0;
@@ -3294,7 +3298,7 @@ NTSTATUS virtual_clear_tls_index( ULONG index )
         server_enter_uninterrupted_section( &virtual_mutex, &sigset );
         LIST_FOR_EACH_ENTRY( thread_data, &teb_list, struct ntdll_thread_data, entry )
         {
-            TEB *teb = CONTAINING_RECORD( thread_data, TEB, GdiTebBatch );
+            TEB *teb = CONTAINING_RECORD( (GDI_TEB_BATCH *)thread_data, TEB, GdiTebBatch );
 #ifdef _WIN64
             WOW_TEB *wow_teb = get_wow_teb( teb );
             if (wow_teb)
@@ -4920,35 +4924,71 @@ static NTSTATUS resolve_drive_symlink( UNICODE_STRING *name, SIZE_T max_name_len
     return STATUS_SUCCESS;
 }
 
+static NTSTATUS follow_device_symlink( WCHAR *buffer, SIZE_T max_path_len, WCHAR *name, SIZE_T *current_path_len )
+{
+    WCHAR *p = buffer;
+    NTSTATUS status = STATUS_SUCCESS;
+    SIZE_T devname_len = 6; // e.g. \??\C:
+    UNICODE_STRING devname;
+    DWORD target_len;
+
+    if (*current_path_len >= devname_len * sizeof(WCHAR) && name[devname_len - 1] == ':') {
+        devname.Buffer = name;
+        devname.Length = devname_len * sizeof(WCHAR);
+        if (!(status = read_nt_symlink( &devname, p, (max_path_len - *current_path_len) / sizeof(WCHAR) + devname_len + 1 )))
+        {
+            target_len = lstrlenW(p);
+            *current_path_len -= devname_len * sizeof(WCHAR); // skip the device name
+            p += target_len;
+
+            memcpy( p, name + devname_len, *current_path_len );
+            *current_path_len += target_len * sizeof(WCHAR);
+        }
+    }
+    else memcpy( p, name, *current_path_len );
+
+    return status;
+}
+
 static NTSTATUS get_memory_section_name( HANDLE process, LPCVOID addr,
                                          MEMORY_SECTION_NAME *info, SIZE_T len, SIZE_T *ret_len )
 {
+    SIZE_T current_path_len, max_path_len;
+    WCHAR *name;
     NTSTATUS status;
 
     if (!info) return STATUS_ACCESS_VIOLATION;
+    max_path_len = len - sizeof(*info) - sizeof(WCHAR); // dont count null char
+    if (!(name = malloc( max_path_len ))) return STATUS_NO_MEMORY;
 
     SERVER_START_REQ( get_mapping_filename )
     {
         req->process = wine_server_obj_handle( process );
         req->addr = wine_server_client_ptr( addr );
         if (len > sizeof(*info) + sizeof(WCHAR))
-            wine_server_set_reply( req, info + 1, len - sizeof(*info) - sizeof(WCHAR) );
+            wine_server_set_reply( req, name, max_path_len );
         status = wine_server_call( req );
         if (!status || status == STATUS_BUFFER_OVERFLOW)
         {
-            if (ret_len) *ret_len = sizeof(*info) + reply->len + sizeof(WCHAR);
-            if (len < sizeof(*info)) status = STATUS_INFO_LENGTH_MISMATCH;
+            current_path_len = reply->len;
+            if (len < sizeof(*info))
+            {
+                status = STATUS_INFO_LENGTH_MISMATCH;
+            }
+            else if (!status) status = follow_device_symlink( (WCHAR *)(info + 1), max_path_len, name, &current_path_len);
+
+            if (ret_len) *ret_len = sizeof(*info) + current_path_len + sizeof(WCHAR);
             if (!status)
             {
                 info->SectionFileName.Buffer = (WCHAR *)(info + 1);
-                info->SectionFileName.Length = reply->len;
-                info->SectionFileName.MaximumLength = reply->len + sizeof(WCHAR);
-                info->SectionFileName.Buffer[reply->len / sizeof(WCHAR)] = 0;
+                info->SectionFileName.Length = current_path_len;
+                info->SectionFileName.MaximumLength = current_path_len + sizeof(WCHAR);
+                info->SectionFileName.Buffer[current_path_len / sizeof(WCHAR)] = 0;
             }
         }
     }
     SERVER_END_REQ;
-
+    free(name);
     return resolve_drive_symlink( &info->SectionFileName, len - sizeof(*info), ret_len, status );
 }
 
