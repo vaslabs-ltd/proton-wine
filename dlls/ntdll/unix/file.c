@@ -1292,18 +1292,18 @@ static BOOLEAN get_dir_case_sensitivity( const char *dir )
 /***********************************************************************
  *           is_hidden_file
  *
- * Check if the specified file should be hidden based on its name and the show dot files option.
+ * Check if the specified file should be hidden based on its unix path and the show dot files option.
  */
-static BOOL is_hidden_file( const UNICODE_STRING *name )
+static BOOL is_hidden_file( const char *name )
 {
-    WCHAR *p, *end;
+    const char *p, *end;
 
     if (show_dot_files) return FALSE;
 
-    end = p = name->Buffer + name->Length/sizeof(WCHAR);
-    while (p > name->Buffer && p[-1] == '\\') p--;
-    while (p > name->Buffer && p[-1] != '\\') p--;
-    return (p < end && *p == '.');
+    end = p = name + strlen( name );
+    while (p > name && p[-1] == '/') p--;
+    while (p > name && p[-1] != '/') p--;
+    return (p < end && p + 1 != end && p[0] == '.' && p[1] != '\\' && (p[1] != '.' || (p + 2 != end && p[2] != '\\')));
 }
 
 
@@ -1600,11 +1600,11 @@ static int fd_get_file_info( int fd, unsigned int options, struct stat *st, ULON
 }
 
 
-static int fd_set_dos_attrib( int fd, UINT attr )
+static int fd_set_dos_attrib( int fd, UINT attr, BOOL force_set )
 {
     /* we only store the HIDDEN and SYSTEM attributes */
     attr &= XATTR_ATTRIBS_MASK;
-    if (attr != 0)
+    if (force_set || attr != 0)
     {
         /* encode the attributes in Samba 3 ASCII format. Samba 4 has extended
          * this format with more features, but retains compatibility with the
@@ -1633,7 +1633,7 @@ static BOOL is_wine_file( HANDLE handle )
 
 
 /* set the stat info and file attributes for a file (by file descriptor) */
-NTSTATUS fd_set_file_info( int fd, UINT attr, HANDLE handle )
+NTSTATUS fd_set_file_info( int fd, UINT attr, HANDLE handle, BOOL force_set_xattr )
 {
     struct stat st;
 
@@ -1660,7 +1660,8 @@ NTSTATUS fd_set_file_info( int fd, UINT attr, HANDLE handle )
     }
     if (fchmod( fd, st.st_mode ) == -1) return errno_to_status( errno );
 
-    if (fd_set_dos_attrib( fd, attr ) == -1 && errno != ENOTSUP)
+    force_set_xattr = force_set_xattr || st.st_nlink > 1;
+    if (fd_set_dos_attrib( fd, attr, force_set_xattr ) == -1 && errno != ENOTSUP)
         WARN( "Failed to set extended attribute " SAMBA_XATTR_DOS_ATTRIB ". errno %d (%s)\n",
               errno, strerror( errno ) );
 
@@ -1705,6 +1706,8 @@ static int get_file_info( const char *path, struct stat *st, ULONG *attr )
         *attr |= parse_samba_dos_attrib_data( attr_data, attr_len );
     else
     {
+        if (is_hidden_file( path ))
+            *attr |= FILE_ATTRIBUTE_HIDDEN;
         if (errno == ENOTSUP) return ret;
 #ifdef ENODATA
         if (errno == ENODATA) return ret;
@@ -2275,11 +2278,6 @@ static NTSTATUS get_dir_data_entry( struct dir_data *dir_data, void *info_ptr, I
     if (class != FileNamesInformation)
     {
         if (st.st_dev != dir_data->id.dev) st.st_ino = 0;  /* ignore inode if on a different device */
-
-        if (!show_dot_files && names->long_name[0] == '.' && names->long_name[1] &&
-            (names->long_name[1] != '.' || names->long_name[2]))
-            attributes |= FILE_ATTRIBUTE_HIDDEN;
-
         fill_file_info( &st, attributes, info, class );
     }
 
@@ -3433,6 +3431,18 @@ static NTSTATUS lookup_unix_name( const WCHAR *name, int name_len, char **buffer
     if (is_unix && (disposition == FILE_OPEN || disposition == FILE_OVERWRITE))
         return STATUS_OBJECT_NAME_NOT_FOUND;
 
+
+    static char *skip_search = NULL;
+    if (skip_search == NULL)
+    {
+        const char *env_var;
+
+				skip_search = getenv("WINE_NO_OPEN_FILE_SEARCH");
+        WARN("Disabling case insensitive search for opening files");
+    }
+    if (skip_search && strcasestr(unix_name, skip_search) && disposition == FILE_OPEN)
+        return STATUS_OBJECT_NAME_NOT_FOUND;
+
     /* now do it component by component */
 
     while (name_len)
@@ -4137,6 +4147,7 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
     OBJECT_ATTRIBUTES new_attr;
     UNICODE_STRING nt_name;
     char *unix_name;
+    BOOL name_hidden = FALSE;
     BOOL created = FALSE;
     unsigned int status;
 
@@ -4179,6 +4190,7 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
 
     if (status == STATUS_SUCCESS)
     {
+        name_hidden = is_hidden_file( unix_name );
         status = open_unix_file( handle, unix_name, access, &new_attr, attributes,
                                  sharing, disposition, options, ea_buffer, ea_length );
         free( unix_name );
@@ -4206,14 +4218,15 @@ NTSTATUS WINAPI NtCreateFile( HANDLE *handle, ACCESS_MASK access, OBJECT_ATTRIBU
             break;
         }
 
-        if (io->Information == FILE_CREATED && (attributes & XATTR_ATTRIBS_MASK))
+        if (io->Information == FILE_CREATED &&
+            ((attributes & XATTR_ATTRIBS_MASK) || name_hidden))
         {
             int fd, needs_close;
 
             /* set any DOS extended attributes */
             if (!server_get_unix_fd( *handle, 0, &fd, &needs_close, NULL, NULL ))
             {
-                if (fd_set_dos_attrib( fd, attributes ) == -1 && errno != ENOTSUP)
+                if (fd_set_dos_attrib( fd, attributes, TRUE ) == -1 && errno != ENOTSUP)
                     WARN( "Failed to set extended attribute " SAMBA_XATTR_DOS_ATTRIB ". errno %d (%s)",
                           errno, strerror( errno ) );
                 if (needs_close) close( fd );
@@ -4384,7 +4397,6 @@ NTSTATUS WINAPI NtQueryFullAttributesFile( const OBJECT_ATTRIBUTES *attr,
             info->AllocationSize = std.AllocationSize;
             info->EndOfFile      = std.EndOfFile;
             info->FileAttributes = basic.FileAttributes;
-            if (is_hidden_file( attr->ObjectName )) info->FileAttributes |= FILE_ATTRIBUTE_HIDDEN;
         }
         free( unix_name );
     }
@@ -4415,10 +4427,7 @@ NTSTATUS WINAPI NtQueryAttributesFile( const OBJECT_ATTRIBUTES *attr, FILE_BASIC
         else if (!S_ISREG(st.st_mode) && !S_ISDIR(st.st_mode))
             status = STATUS_INVALID_INFO_CLASS;
         else
-        {
             status = fill_file_info( &st, attributes, info, FileBasicInformation );
-            if (is_hidden_file( attr->ObjectName )) info->FileAttributes |= FILE_ATTRIBUTE_HIDDEN;
-        }
         free( unix_name );
     }
     else WARN( "%s not found (%x)\n", debugstr_us(attr->ObjectName), status );
@@ -4734,9 +4743,13 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
         {
             const FILE_BASIC_INFORMATION *info = ptr;
             LARGE_INTEGER mtime, atime;
+            char *unix_name;
 
             if ((status = server_get_unix_fd( handle, 0, &fd, &needs_close, NULL, NULL )))
                 return io->u.Status = status;
+
+            if ((status = server_get_unix_name( handle, &unix_name )))
+                unix_name = NULL;
 
             mtime.QuadPart = info->LastWriteTime.QuadPart == -1 ? 0 : info->LastWriteTime.QuadPart;
             atime.QuadPart = info->LastAccessTime.QuadPart == -1 ? 0 : info->LastAccessTime.QuadPart;
@@ -4745,9 +4758,13 @@ NTSTATUS WINAPI NtSetInformationFile( HANDLE handle, IO_STATUS_BLOCK *io,
                 status = set_file_times( fd, &mtime, &atime );
 
             if (status == STATUS_SUCCESS && info->FileAttributes)
-                status = fd_set_file_info( fd, info->FileAttributes, handle );
+            {
+                BOOL force_xattr = unix_name && is_hidden_file( unix_name );
+                status = fd_set_file_info( fd, info->FileAttributes, handle, force_xattr );
+            }
 
             if (needs_close) close( fd );
+            free( unix_name );
         }
         else status = STATUS_INVALID_PARAMETER_3;
         break;
@@ -5065,18 +5082,29 @@ void release_fileio( struct async_fileio *io )
 struct async_fileio *alloc_fileio( DWORD size, async_callback_t callback, HANDLE handle )
 {
     /* first free remaining previous fileinfos */
-    struct async_fileio *io = InterlockedExchangePointer( (void **)&fileio_freelist, NULL );
+    struct async_fileio *old_io = InterlockedExchangePointer( (void **)&fileio_freelist, NULL );
+    struct async_fileio *io = NULL;
 
-    while (io)
+    while (old_io)
     {
-        struct async_fileio *next = io->next;
-        free( io );
-        io = next;
+        if (!io && old_io->size >= size && old_io->size <= max(4096, 4 * size))
+        {
+            io     = old_io;
+            size   = old_io->size;
+            old_io = old_io->next;
+        }
+        else
+        {
+            struct async_fileio *next = old_io->next;
+            free( old_io );
+            old_io = next;
+        }
     }
 
-    if ((io = malloc( size )))
+    if (io || (io = malloc( size )))
     {
         io->callback = callback;
+        io->size     = size;
         io->handle   = handle;
     }
     return io;
