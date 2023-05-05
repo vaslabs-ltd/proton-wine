@@ -2288,6 +2288,7 @@ long long ram_reporting_bias;
 static void hacks_init(void)
 {
     static const char upc_exe[] = "Ubisoft Game Launcher\\upc.exe";
+    static const char upc2_exe[] = "upc.exe";
     const char *env_str, *sgi;
 
     if ((env_str = getenv("WINE_RAM_REPORTING_BIAS")))
@@ -2311,6 +2312,7 @@ static void hacks_init(void)
     else if (main_argc > 1)
     {
         fsync_simulate_sched_quantum = !!strstr(main_argv[1], upc_exe);
+        fsync_simulate_sched_quantum = !!strstr(main_argv[1], upc2_exe);
         fsync_simulate_sched_quantum = fsync_simulate_sched_quantum || !!strstr(main_argv[1], "PlanetZoo.exe");
         fsync_simulate_sched_quantum = fsync_simulate_sched_quantum || !!strstr(main_argv[1], "GTA5.exe");
     }
