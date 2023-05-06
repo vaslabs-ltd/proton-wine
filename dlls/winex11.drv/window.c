@@ -538,14 +538,11 @@ static void sync_window_region( struct x11drv_win_data *data, HRGN win_region )
 
 
 /***********************************************************************
- *              sync_window_opacity
+ *              set_window_opacity
  */
-static void sync_window_opacity( Display *display, Window win,
-                                 COLORREF key, BYTE alpha, DWORD flags )
+static void set_window_opacity( Display *display, Window win, BYTE alpha )
 {
-    unsigned long opacity = 0xffffffff;
-
-    if (flags & LWA_ALPHA) opacity = (0xffffffff / 0xff) * alpha;
+    unsigned long opacity = (0xffffffff / 0xff) * alpha;
 
     if (opacity == 0xffffffff)
         XDeleteProperty( display, win, x11drv_atom(_NET_WM_WINDOW_OPACITY) );
@@ -1055,19 +1052,8 @@ static void set_initial_wm_hints( Display *display, Window window )
     /* class hints */
     if ((class_hints = XAllocClassHint()))
     {
-        static char steam_proton[] = "steam_proton";
-        const char *app_id = getenv("SteamAppId");
-        char proton_app_class[128];
-
-        if(app_id && *app_id){
-            snprintf(proton_app_class, sizeof(proton_app_class), "steam_app_%s", app_id);
-            class_hints->res_name = proton_app_class;
-            class_hints->res_class = proton_app_class;
-        }else{
-            class_hints->res_name = steam_proton;
-            class_hints->res_class = steam_proton;
-        }
-
+        class_hints->res_name = process_name;
+        class_hints->res_class = process_name;
         XSetClassHint( display, window, class_hints );
         XFree( class_hints );
     }
@@ -2075,7 +2061,7 @@ static void create_whole_window( struct x11drv_win_data *data )
 
     /* set the window opacity */
     if (!NtUserGetLayeredWindowAttributes( data->hwnd, &key, &alpha, &layered_flags )) layered_flags = 0;
-    sync_window_opacity( data->display, data->whole_window, key, alpha, layered_flags );
+    set_window_opacity( data->display, data->whole_window, (layered_flags & LWA_ALPHA) ? alpha : 0xff );
 
     XFlush( data->display );  /* make sure the window exists before we start painting to it */
 
@@ -2224,7 +2210,7 @@ void X11DRV_SetWindowStyle( HWND hwnd, INT offset, STYLESTRUCT *style )
         data->layered_attributes = FALSE;
         need_sync_gl = TRUE;
         set_window_visual( data, &default_visual, FALSE );
-        sync_window_opacity( data->display, data->whole_window, 0, 0, 0 );
+        set_window_opacity( data->display, data->whole_window, 0xff );
         if (data->surface) set_surface_color_key( data->surface, CLR_INVALID );
     }
 done:
@@ -3483,7 +3469,7 @@ void X11DRV_SetLayeredWindowAttributes( HWND hwnd, COLORREF key, BYTE alpha, DWO
         set_window_visual( data, &default_visual, FALSE );
 
         if (data->whole_window)
-            sync_window_opacity( data->display, data->whole_window, key, alpha, flags );
+            set_window_opacity( data->display, data->whole_window, (flags & LWA_ALPHA) ? alpha : 0xff );
         if (data->surface)
             set_surface_color_key( data->surface, (flags & LWA_COLORKEY) ? key : CLR_INVALID );
 
@@ -3511,7 +3497,7 @@ void X11DRV_SetLayeredWindowAttributes( HWND hwnd, COLORREF key, BYTE alpha, DWO
         Window win = X11DRV_get_whole_window( hwnd );
         if (win)
         {
-            sync_window_opacity( gdi_display, win, key, alpha, flags );
+            set_window_opacity( gdi_display, win, (flags & LWA_ALPHA) ? alpha : 0xff );
             if (flags & LWA_COLORKEY)
                 FIXME( "LWA_COLORKEY not supported on foreign process window %p\n", hwnd );
         }
@@ -3527,7 +3513,6 @@ BOOL X11DRV_UpdateLayeredWindow( HWND hwnd, const UPDATELAYEREDWINDOWINFO *info,
 {
     struct window_surface *surface;
     struct x11drv_win_data *data;
-    BLENDFUNCTION blend = { AC_SRC_OVER, 0, 255, 0 };
     COLORREF color_key = (info->dwFlags & ULW_COLORKEY) ? info->crKey : CLR_INVALID;
     char buffer[FIELD_OFFSET( BITMAPINFO, bmiColors[256] )];
     BITMAPINFO *bmi = (BITMAPINFO *)buffer;
@@ -3556,6 +3541,10 @@ BOOL X11DRV_UpdateLayeredWindow( HWND hwnd, const UPDATELAYEREDWINDOWINFO *info,
         surface = data->surface;
     }
     else set_surface_color_key( surface, color_key );
+
+    if (data->whole_window)
+        set_window_opacity( data->display, data->whole_window,
+                            (info->dwFlags & ULW_ALPHA) ? info->pblend->SourceConstantAlpha : 0xff );
 
     if (surface) window_surface_add_ref( surface );
     mapped = data->mapped;
@@ -3593,16 +3582,15 @@ BOOL X11DRV_UpdateLayeredWindow( HWND hwnd, const UPDATELAYEREDWINDOWINFO *info,
     {
         intersect_rect( &rect, &rect, info->prcDirty );
         memcpy( src_bits, dst_bits, bmi->bmiHeader.biSizeImage );
-        NtGdiPatBlt( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top, BLACKNESS );
     }
     src_rect = rect;
     if (info->pptSrc) OffsetRect( &src_rect, info->pptSrc->x, info->pptSrc->y );
     NtGdiTransformPoints( info->hdcSrc, (POINT *)&src_rect, (POINT *)&src_rect, 2, NtGdiDPtoLP );
 
-    ret = NtGdiAlphaBlend( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
+    ret = NtGdiStretchBlt( hdc, rect.left, rect.top, rect.right - rect.left, rect.bottom - rect.top,
                            info->hdcSrc, src_rect.left, src_rect.top,
                            src_rect.right - src_rect.left, src_rect.bottom - src_rect.top,
-                           (info->dwFlags & ULW_ALPHA) ? *info->pblend : blend, 0 );
+                           SRCCOPY, 0 );
     if (ret)
     {
         memcpy( dst_bits, src_bits, bmi->bmiHeader.biSizeImage );
