@@ -98,7 +98,6 @@ AddReg=\
     VersionInfo,\
     LicenseInformation, \
     NVIDIANGX, \
-    WineGEOverrides, \
     ProtonOverrides
 
 [DefaultInstall.ntamd64]
@@ -127,7 +126,6 @@ AddReg=\
     VersionInfo.ntamd64,\
     LicenseInformation, \
     NVIDIANGX, \
-    WineGEOverrides, \
     ProtonOverrides
 
 [DefaultInstall.ntarm64]
@@ -172,7 +170,6 @@ AddReg=\
     VersionInfo.ntamd64,\
     LicenseInformation, \
     NVIDIANGX, \
-    WineGEOverrides, \
     ProtonOverrides
 
 [Wow64Install.ntarm64]
@@ -2762,10 +2759,6 @@ SortFiles = 10,globalization\sorting
 
 [NVIDIANGX]
 HKLM,Software\NVIDIA Corporation\Global\NGXCore,"FullPath",,"C:\Windows\System32"
-
-[WineGEOverrides]
-HKLM,System\CurrentControlSet\Services\winebus,"DisableHidraw",0x10001,"1"
-HKLM,System\CurrentControlSet\Services\winebus,"Enable SDL",0x10001,"1"
 
 [ProtonOverrides]
 HKLM,Software\Khronos\OpenXR\1,"ActiveRuntime",,"C:\openxr\wineopenxr64.json"
