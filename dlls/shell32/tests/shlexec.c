@@ -66,7 +66,7 @@ static BOOL is_elevated;
 
 static const char* encodeA(const char* str)
 {
-    static char encoded[2*1024+1];
+    static char encoded[8*1024+1];
     char*       ptr;
     size_t      len,i;
 
@@ -94,7 +94,7 @@ static unsigned decode_char(char c)
 
 static char* decodeA(const char* str)
 {
-    static char decoded[1024];
+    static char decoded[4096];
     char*       ptr;
     size_t      len,i;
 
@@ -115,7 +115,7 @@ static char* decodeA(const char* str)
 static void WINAPIV __WINE_PRINTF_ATTR(2,3) childPrintf(HANDLE h, const char* fmt, ...)
 {
     va_list valist;
-    char        buffer[1024];
+    char        buffer[8192];
     DWORD       w;
 
     va_start(valist, fmt);
@@ -126,7 +126,7 @@ static void WINAPIV __WINE_PRINTF_ATTR(2,3) childPrintf(HANDLE h, const char* fm
 
 static char* getChildString(const char* sect, const char* key)
 {
-    char        buf[1024];
+    char        buf[8192];
     char*       ret;
 
     GetPrivateProfileStringA(sect, key, "-", buf, sizeof(buf), child_file);
@@ -348,11 +348,11 @@ static void dump_child_(const char* file, int line)
  *
  ***/
 
-static char shell_call[2048];
+static char shell_call[4096];
 static void WINAPIV __WINE_PRINTF_ATTR(2,3) _okShell(int condition, const char *msg, ...)
 {
     va_list valist;
-    char buffer[2048];
+    char buffer[12288];
 
     strcpy(buffer, shell_call);
     strcat(buffer, " ");
@@ -1891,6 +1891,7 @@ static void test_fileurls(void)
 static void test_urls(void)
 {
     char url[MAX_PATH + 15];
+    char long_url[2048];
     INT_PTR rc;
 
     if (!create_test_class("fakeproto", FALSE))
@@ -1962,6 +1963,17 @@ static void test_urls(void)
     okChildInt("argcA", 5);
     okChildString("argvA3", "URL");
     okChildString("argvA4", "shlproto://foo/bar");
+
+    memset(long_url, 0, sizeof(long_url));
+    strcpy(long_url, "shlproto://foo/bar");
+    memset(long_url + strlen(long_url), 'r', sizeof(long_url) - strlen(long_url) - 5);
+    strcat(long_url, ".exe");
+
+    rc = shell_execute(NULL, long_url, NULL, NULL);
+    ok(rc > 32, "%s failed: rc=%lu\n", shell_call, rc);
+    okChildInt("argcA", 5);
+    okChildString("argvA3", "URL");
+    okChildString("argvA4", long_url);
 
     /* Environment variables are expanded in URLs (but not in file URLs!) */
     rc = shell_execute_ex(SEE_MASK_DOENVSUBST | SEE_MASK_FLAG_NO_UI,
